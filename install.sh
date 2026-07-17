@@ -529,6 +529,30 @@ run_onboarding() {
         20) ui_info "跳过模型配置" ;;
     esac
 
+    # ===== 1b. Embedding 配置（记忆系统用）=====
+    ui_step "【1b/4】Embedding 配置（记忆系统向量检索用）"
+    echo "  1) 本地模型 BAAI/bge-small-zh-v1.5（零成本，自动下载 ~100MB，需 ~1GB 内存）"
+    echo "  2) 硅基流动 SiliconFlow API（需 API Key，按量计费，速度快）"
+    echo "  3) 跳过（稍后手动配置，记忆系统暂不可用）"
+    read -p "选择 Embedding [1-3，默认 1]: " embedding_choice </dev/tty
+    embedding_choice="${embedding_choice:-1}"
+
+    local embedding_provider="" embedding_model="" embedding_key="" embedding_url=""
+    case "$embedding_choice" in
+        1) embedding_provider="local"
+           embedding_model="BAAI/bge-small-zh-v1.5"
+           ui_info "已选择本地 Embedding（首次使用时自动下载模型，约 100MB）" ;;
+        2) embedding_provider="siliconflow"
+           embedding_model="BAAI/bge-large-zh-v1.5"
+           embedding_url="https://api.siliconflow.cn/v1"
+           read -p "硅基流动 API Key (sk-...): " embedding_key </dev/tty
+           if [[ -z "$embedding_key" ]]; then
+               ui_warn "未填写 API Key，Embedding 将不可用（可稍后配置）"
+               embedding_provider=""
+           fi ;;
+        3) ui_info "跳过 Embedding 配置（记忆系统暂不可用）" ;;
+    esac
+
     # ===== 2. 技能选择 =====
     ui_step "【2/4】技能选择（内置工具）"
     echo "  1) 全部启用（推荐）"
@@ -608,6 +632,16 @@ run_onboarding() {
     local primary_model="${provider_model:-gpt-4o-mini}"
     if [[ "$provider_choice" == "20" ]]; then primary_model="gpt-4o-mini"; fi
 
+    # 生成 embedding JSON 配置
+    local embedding_json="{ \"engine\": \"builtin\" }"
+    if [[ -n "$embedding_provider" ]]; then
+        if [[ "$embedding_provider" == "local" ]]; then
+            embedding_json="{ \"engine\": \"builtin\", \"embedding\": { \"provider\": \"local\", \"model\": \"$embedding_model\" } }"
+        else
+            embedding_json="{ \"engine\": \"builtin\", \"embedding\": { \"provider\": \"$embedding_provider\", \"model\": \"$embedding_model\", \"baseUrl\": \"$embedding_url\", \"apiKey\": \"$embedding_key\" } }"
+        fi
+    fi
+
     cat > "$cfg" <<EOCFG
 {
   "gateway": {
@@ -619,7 +653,7 @@ run_onboarding() {
   "models": { "primary": "$primary_model" },
   "skills": { "enabled": "$skills_list" },
   "channels": $channels_json,
-  "memory": { "engine": "builtin" }
+  "memory": $embedding_json
 }
 EOCFG
     ui_success "配置已保存: $cfg"
