@@ -10,17 +10,66 @@
 
 ### 一键安装（推荐）
 
+**Linux / macOS（bash）：**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/UA-Jin/CradleRing/main/install.sh | bash
 ```
 
+**Windows（PowerShell）：**
+
+```powershell
+irm https://raw.githubusercontent.com/UA-Jin/CradleRing/main/install.ps1 | iex
+```
+
 > **说明**：一键安装脚本会自动检测并安装所有依赖：
-> - **Rust 工具链**：未安装时自动通过 rustup 安装
-> - **C 编译器（gcc/cc）**：未安装时自动通过系统包管理器安装（apt/yum/dnf/apk/pacman）
+> - **Rust 工具链**：未安装时自动通过 rustup 安装（Windows 自动下载 rustup-init.exe）
+> - **C 编译器**：Linux/macOS 自动安装（apt/yum/dnf/apk/pacman）；Windows 需手动安装 Visual Studio Build Tools 或 MinGW
 > - **源码下载**：本地无源码时自动从 GitHub 下载（支持 git clone 或 curl tarball）
 > - **前端构建**：自动安装 pnpm 依赖并构建（--ignore-scripts 跳过构建脚本检查）
+> - **自启动**：Linux（systemd）、macOS（launchd）、Windows（Task Scheduler）自动注册开机自启
 >
 > 全程无需手动安装任何依赖，适合全新服务器一键部署。
+
+### 开放外网访问（绑 0.0.0.0）
+
+默认网关只绑定 `127.0.0.1`（本机访问）。如需让局域网/公网访问，修改配置文件：
+
+**Linux / macOS：**
+
+```bash
+# 编辑配置
+nano ~/.cradle-ring/cradle-ring.json
+
+# 把 "gateway.bind" 改为 "0.0.0.0"（或 "all"）
+{
+  "gateway": {
+    "bind": "0.0.0.0",
+    "port": 18800,
+    "auth": { "token": "your-token" }
+  }
+}
+
+# 重启网关生效
+cradle-ring gateway start
+```
+
+**Windows：**
+
+```powershell
+# 编辑配置
+notepad $env:USERPROFILE\.cradle-ring\cradle-ring.json
+
+# 同上，把 "gateway.bind" 改为 "0.0.0.0"
+
+# 重启网关
+cradle-ring gateway start
+```
+
+> ⚠️ **安全提示**：绑 `0.0.0.0` 后所有网络接口可访问，请确保：
+> 1. 已设置强密码（安装时生成的随机密码）
+> 2. 防火墙已放行端口（Linux: `ufw allow 18800`；Windows: 防火墙入站规则）
+> 3. 建议仅在内网使用，公网部署请加反向代理（Nginx/Caddy）+ HTTPS
 
 ### 手动安装
 
@@ -33,7 +82,8 @@ cd CradleRing
 cargo build --release --bin cradle-ring
 
 # 3. 安装
-./install.sh
+./install.sh          # Linux / macOS
+.\install.ps1         # Windows（PowerShell 管理员）
 
 # 4. 启动
 cradle-ring gateway start
@@ -245,7 +295,7 @@ CradleRing/
 ### ✅ 允许
 
 - **企业使用**：企业内部可自由部署和使用，无限制
-- **二次开发商用**：可基于 CradleRing 开发自己的产品 但不允许销售可以开源分享
+- **二次开发商用**：可基于 CradleRing 开发自己的产品并销售
 - **学习研究**：可自由阅读、学习、研究源代码
 
 ### ❌ 禁止
@@ -261,7 +311,7 @@ CradleRing/
 4. **商用限制**：不得将 CradleRing 或其修改版本作为**服务**（SaaS）向第三方收费提供
 5. **专利授权**：贡献者授予使用其专利的免费许可
 
-**例外**：如需将 CradleRing 作为 SaaS 服务提供，请联系 [1](mailto:1) 获取商业授权。
+**例外**：如需将 CradleRing 作为 SaaS 服务提供，请联系 [cradlering@example.com](mailto:cradlering@example.com) 获取商业授权。
 
 ---
 
