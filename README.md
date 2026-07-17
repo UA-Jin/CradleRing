@@ -261,7 +261,7 @@ CradleRing/
 4. **商用限制**：不得将 CradleRing 或其修改版本作为**服务**（SaaS）向第三方收费提供
 5. **专利授权**：贡献者授予使用其专利的免费许可
 
-**例外**：如需将 CradleRing 作为 SaaS 服务提供，请联系 [cradlering@example.com](mailto:cradlering@example.com) 获取商业授权。
+**例外**：如需将 CradleRing 作为 SaaS 服务提供，请联系 [1](mailto:1) 获取商业授权。
 
 ---
 
