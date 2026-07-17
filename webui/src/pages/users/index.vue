@@ -217,7 +217,7 @@ const availableScopes = [
   'workflows.read', 'workflows.write', 'logs.read', 'admin',
 ];
 
-const roleColors = ['#f53f3f', '#722ed1', '#165dff', '#00b42a', '#ff7d00', '#0fc6c2', '#86909c'];
+const roleColors = ['#ff4c51', '#7340e0', '#8c57ff', '#56ca00', '#ffb400', '#16b1ff', '#6d6777'];
 
 const editing = reactive<any>({
   id: '', username: '', displayName: '', email: '', password: '',
@@ -225,7 +225,7 @@ const editing = reactive<any>({
 });
 
 const editingRole = reactive<any>({
-  name: '', label: '', description: '', color: '#0fc6c2', scopes: [], builtin: false, isNew: false,
+  name: '', label: '', description: '', color: '#16b1ff', scopes: [], builtin: false, isNew: false,
 });
 
 const defaultScopes = ref<string[]>([]);
@@ -237,12 +237,12 @@ const filteredUsers = computed(() =>
 const roleSummary = computed(() => {
   const map: Record<string, any> = {};
   for (const r of allRoles.value) {
-    map[r.name] = { role: r.name, label: r.label, color: r.color || '#86909c', count: users.value.filter((u) => u.role === r.name).length };
+    map[r.name] = { role: r.name, label: r.label, color: r.color || '#6d6777', count: users.value.filter((u) => u.role === r.name).length };
   }
   return Object.values(map);
 });
 
-function roleColor(r: string) { return allRoles.value.find((x) => x.name === r)?.color || '#86909c'; }
+function roleColor(r: string) { return allRoles.value.find((x) => x.name === r)?.color || '#6d6777'; }
 function roleLabel(r: string) { return allRoles.value.find((x) => x.name === r)?.label || r; }
 
 async function load() {
@@ -307,7 +307,7 @@ async function onDelete(id: string) {
 }
 
 function openCreateRole() {
-  Object.assign(editingRole, { name: '', label: '', description: '', color: '#0fc6c2', scopes: [], builtin: false, isNew: true });
+  Object.assign(editingRole, { name: '', label: '', description: '', color: '#16b1ff', scopes: [], builtin: false, isNew: true });
   roleVisible.value = true;
 }
 

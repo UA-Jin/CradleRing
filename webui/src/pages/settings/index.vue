@@ -56,11 +56,11 @@ const appStore = useAppStore();
 const userStore = useUserStore();
 
 const colors = [
-  { value: '#165dff', label: '蓝' },
-  { value: '#00b42a', label: '绿' },
-  { value: '#ff7d00', label: '橙' },
-  { value: '#f53f3f', label: '红' },
-  { value: '#722ed1', label: '紫' },
+  { value: '#8c57ff', label: '蓝' },
+  { value: '#56ca00', label: '绿' },
+  { value: '#ffb400', label: '橙' },
+  { value: '#ff4c51', label: '红' },
+  { value: '#7340e0', label: '紫' },
 ];
 
 const profile = reactive({ displayName: '', email: '', approvalEnabled: true, password: '' });

@@ -92,7 +92,7 @@ const form = reactive<any>({
 });
 
 function avatarColor(role: string) {
-  const colors = ['#165dff', '#00b42a', '#ff7d00', '#f53f3f', '#722ed1', '#0fc6c2'];
+  const colors = ['#8c57ff', '#56ca00', '#ffb400', '#ff4c51', '#7340e0', '#16b1ff'];
   let hash = 0;
   for (const c of role) hash = (hash * 31 + c.charCodeAt(0)) | 0;
   return colors[Math.abs(hash) % colors.length];

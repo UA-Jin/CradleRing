@@ -47,7 +47,7 @@
 
       <div class="messages" ref="messagesEl">
         <div v-for="m in messages" :key="m.ts" class="msg" :class="m.role">
-          <a-avatar :size="32" :style="{ backgroundColor: m.role === 'user' ? '#165dff' : '#00b42a' }">
+          <a-avatar :size="32" :style="{ backgroundColor: m.role === 'user' ? '#8c57ff' : '#56ca00' }">
             {{ m.role === 'user' ? '我' : 'AI' }}
           </a-avatar>
           <div class="msg-body">
@@ -56,7 +56,7 @@
           </div>
         </div>
         <div v-if="sending" class="msg assistant">
-          <a-avatar :size="32" :style="{ backgroundColor: '#00b42a' }">AI</a-avatar>
+          <a-avatar :size="32" :style="{ backgroundColor: '#56ca00' }">AI</a-avatar>
           <div class="msg-body">
             <div class="msg-role">助手 <a-spin dot :size="14" style="display:inline-block;margin-left:8px" /></div>
             <div class="msg-content typing">思考中...</div>

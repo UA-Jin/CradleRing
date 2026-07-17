@@ -220,11 +220,11 @@ function animateValue(key: keyof typeof animatedValues, target: number, duration
 }
 
 const statCards = [
-  { bg: 'linear-gradient(135deg, #00b42a, #23c343)' },
-  { bg: 'linear-gradient(135deg, #f53f3f, #f76560)' },
-  { bg: 'linear-gradient(135deg, #ff7d00, #ff9626)' },
-  { bg: 'linear-gradient(135deg, #722ed1, #8d4eda)' },
-  { bg: 'linear-gradient(135deg, #165dff, #3c7eff)' },
+  { bg: 'linear-gradient(135deg, #56ca00, #56ca00)' },
+  { bg: 'linear-gradient(135deg, #ff4c51, #ff4c51)' },
+  { bg: 'linear-gradient(135deg, #ffb400, #ffb400)' },
+  { bg: 'linear-gradient(135deg, #7340e0, #7340e0)' },
+  { bg: 'linear-gradient(135deg, #8c57ff, #8c57ff)' },
 ];
 
 const filteredNodes = computed(() =>
@@ -247,7 +247,7 @@ function riskLabel(score: number) {
   return '正常';
 }
 function severityColor(sev: string) {
-  return ({ critical: '#f53f3f', high: '#ff7d00', medium: '#722ed1', low: '#165dff', info: '#86909c' } as any)[sev] || '#86909c';
+  return ({ critical: '#ff4c51', high: '#ffb400', medium: '#7340e0', low: '#8c57ff', info: '#6d6777' } as any)[sev] || '#6d6777';
 }
 function formatTime(ts: number) {
   if (!ts) return '未知';
@@ -260,8 +260,8 @@ const mapOption = computed(() => ({
   visualMap: {
     min: 0, max: 100,
     text: ['高风险', '低风险'],
-    inRange: { color: ['#00b42a', '#ff7d00', '#f53f3f'] },
-    textStyle: { color: appStore.isDark ? '#c9cdd4' : '#4e5969' },
+    inRange: { color: ['#56ca00', '#ffb400', '#ff4c51'] },
+    textStyle: { color: appStore.isDark ? '#c9cdd4' : '#433c50' },
   },
   series: [{
     type: 'scatter',
@@ -271,7 +271,7 @@ const mapOption = computed(() => ({
       value: [100 + i * 10, 30 + (i % 5) * 8, n.riskScore],
     })),
     symbolSize: (val: any) => Math.max(8, val[2] / 5),
-    itemStyle: { color: '#165dff' },
+    itemStyle: { color: '#8c57ff' },
   }],
   geo: {
     map: 'world',
@@ -287,12 +287,12 @@ const latencyTrendOption = computed(() => {
   return {
     tooltip: { trigger: 'axis' },
     grid: { left: 40, right: 20, top: 30, bottom: 30 },
-    xAxis: { type: 'category', data: hours, axisLabel: { color: appStore.isDark ? '#86909c' : '#4e5969' } },
-    yAxis: { type: 'value', name: 'ms', axisLabel: { color: appStore.isDark ? '#86909c' : '#4e5969' } },
+    xAxis: { type: 'category', data: hours, axisLabel: { color: appStore.isDark ? '#6d6777' : '#433c50' } },
+    yAxis: { type: 'value', name: 'ms', axisLabel: { color: appStore.isDark ? '#6d6777' : '#433c50' } },
     series: [{
       type: 'line', smooth: true, data,
-      areaStyle: { opacity: 0.3, color: '#165dff' },
-      itemStyle: { color: '#165dff' },
+      areaStyle: { opacity: 0.3, color: '#8c57ff' },
+      itemStyle: { color: '#8c57ff' },
     }],
   };
 });
@@ -302,8 +302,8 @@ const riskRankOption = computed(() => {
   return {
     tooltip: { trigger: 'axis' },
     grid: { left: 100, right: 20, top: 20, bottom: 30 },
-    xAxis: { type: 'value', axisLabel: { color: appStore.isDark ? '#86909c' : '#4e5969' } },
-    yAxis: { type: 'category', data: top.map((n) => n.name), axisLabel: { color: appStore.isDark ? '#86909c' : '#4e5969' } },
+    xAxis: { type: 'value', axisLabel: { color: appStore.isDark ? '#6d6777' : '#433c50' } },
+    yAxis: { type: 'category', data: top.map((n) => n.name), axisLabel: { color: appStore.isDark ? '#6d6777' : '#433c50' } },
     series: [{
       type: 'bar',
       data: top.map((n) => ({ value: n.riskScore, itemStyle: { color: riskColor(n.riskScore) } })),
@@ -430,17 +430,17 @@ onUnmounted(() => {
   height: 8px;
   border-radius: 50%;
   margin-right: 6px;
-  &.online { background: #00b42a; box-shadow: 0 0 6px #00b42a; }
-  &.offline { background: #f53f3f; box-shadow: 0 0 6px #f53f3f; }
-  &.high_latency { background: #ff7d00; box-shadow: 0 0 6px #ff7d00; }
+  &.online { background: #56ca00; box-shadow: 0 0 6px #56ca00; }
+  &.offline { background: #ff4c51; box-shadow: 0 0 6px #ff4c51; }
+  &.high_latency { background: #ffb400; box-shadow: 0 0 6px #ffb400; }
 }
 .status-text { font-size: 12px; color: var(--color-text-2); }
 
 .device-name { font-weight: 500; color: var(--color-text-1); }
 .device-id { font-size: 11px; color: var(--color-text-3); font-family: monospace; }
 
-.latency-high { color: #f53f3f; font-weight: 600; }
-.latency-ok { color: #00b42a; }
+.latency-high { color: #ff4c51; font-weight: 600; }
+.latency-ok { color: #56ca00; }
 .muted { color: var(--color-text-3); }
 
 :deep(.arco-card) {

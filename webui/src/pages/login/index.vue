@@ -141,7 +141,7 @@ onMounted(() => {
 
 .login-banner {
   flex: 1;
-  background: linear-gradient(135deg, #165dff 0%, #0fc6c2 100%);
+  background: linear-gradient(135deg, #8c57ff 0%, #16b1ff 100%);
   color: #fff;
   display: flex;
   align-items: center;

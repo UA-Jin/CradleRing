@@ -38,7 +38,7 @@
           <a-list v-else>
             <a-list-item v-for="i in pendingApprovals" :key="i.id">
               <a-list-item-meta :title="i.title" :description="`${i.requestedUsername} · ${i.command.slice(0, 50)}`">
-                <template #avatar><a-avatar :style="{ backgroundColor: '#ff7d00' }"><icon-clock-circle /></a-avatar></template>
+                <template #avatar><a-avatar :style="{ backgroundColor: '#ffb400' }"><icon-clock-circle /></a-avatar></template>
               </a-list-item-meta>
               <template #actions>
                 <a-button type="primary" size="small" @click="quickApprove(i.id)">同意</a-button>
@@ -99,7 +99,7 @@ const recentSessions = ref<any[]>([]);
 
 const trendOption = computed(() => ({
   tooltip: { trigger: 'axis' },
-  legend: { data: ['调用次数', '费用($)'], textStyle: { color: '#86909c' } },
+  legend: { data: ['调用次数', '费用($)'], textStyle: { color: '#6d6777' } },
   grid: { left: 40, right: 40, top: 40, bottom: 30 },
   xAxis: { type: 'category', data: ['周一', '周二', '周三', '周四', '周五', '周六', '周日'] },
   yAxis: [
@@ -107,22 +107,22 @@ const trendOption = computed(() => ({
     { type: 'value', name: '费用' },
   ],
   series: [
-    { name: '调用次数', type: 'line', smooth: true, data: [12, 18, 25, 30, 22, 15, 8], itemStyle: { color: '#165dff' } },
-    { name: '费用($)', type: 'line', smooth: true, yAxisIndex: 1, data: [0.2, 0.5, 1.2, 1.8, 0.9, 0.4, 0.1], itemStyle: { color: '#00b42a' } },
+    { name: '调用次数', type: 'line', smooth: true, data: [12, 18, 25, 30, 22, 15, 8], itemStyle: { color: '#8c57ff' } },
+    { name: '费用($)', type: 'line', smooth: true, yAxisIndex: 1, data: [0.2, 0.5, 1.2, 1.8, 0.9, 0.4, 0.1], itemStyle: { color: '#56ca00' } },
   ],
 }));
 
 const distOption = computed(() => ({
   tooltip: { trigger: 'item' },
-  legend: { bottom: 0, textStyle: { color: '#86909c' } },
+  legend: { bottom: 0, textStyle: { color: '#6d6777' } },
   series: [{
     type: 'pie',
     radius: ['40%', '70%'],
     data: [
-      { value: 40, name: '对话', itemStyle: { color: '#165dff' } },
-      { value: 25, name: '工具调用', itemStyle: { color: '#00b42a' } },
-      { value: 20, name: '搜索', itemStyle: { color: '#ff7d00' } },
-      { value: 15, name: '其他', itemStyle: { color: '#86909c' } },
+      { value: 40, name: '对话', itemStyle: { color: '#8c57ff' } },
+      { value: 25, name: '工具调用', itemStyle: { color: '#56ca00' } },
+      { value: 20, name: '搜索', itemStyle: { color: '#ffb400' } },
+      { value: 15, name: '其他', itemStyle: { color: '#6d6777' } },
     ],
   }],
 }));
@@ -135,10 +135,10 @@ async function loadOverview() {
       rpc.call<any>('approval.instances.list', { status: 'pending' }),
     ]);
     cards.value = [
-      { title: '总会话数', value: sessions.count || 0, color: '#165dff', icon: markRaw(IconStorage), foot: '已创建的对话会话' },
-      { title: '待审批', value: stats.pending || 0, color: '#ff7d00', icon: markRaw(IconCheckCircle), foot: '等待处理的审批' },
-      { title: '审批流模板', value: stats.flowsCount || 0, color: '#00b42a', icon: markRaw(IconMindMapping), foot: '已配置的审批流' },
-      { title: '审批完成', value: (stats.approved || 0) + (stats.completed || 0), color: '#722ed1', icon: markRaw(IconTrophy), foot: '累计已完成的审批' },
+      { title: '总会话数', value: sessions.count || 0, color: '#8c57ff', icon: markRaw(IconStorage), foot: '已创建的对话会话' },
+      { title: '待审批', value: stats.pending || 0, color: '#ffb400', icon: markRaw(IconCheckCircle), foot: '等待处理的审批' },
+      { title: '审批流模板', value: stats.flowsCount || 0, color: '#56ca00', icon: markRaw(IconMindMapping), foot: '已配置的审批流' },
+      { title: '审批完成', value: (stats.approved || 0) + (stats.completed || 0), color: '#7340e0', icon: markRaw(IconTrophy), foot: '累计已完成的审批' },
     ];
     pendingApprovals.value = (approvals.instances || []).slice(0, 5);
     recentSessions.value = (sessions.sessions || []).slice(0, 6);

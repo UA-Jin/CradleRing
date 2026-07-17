@@ -1,116 +1,122 @@
 @import '@arco-design/web-vue/es/style/theme/index.less';
 
-// ---------- 全局 CSS 变量：对齐 Arco Pro Vue 的 token 体系 ----------
+// ============================================================================
+// CradleRing 设计系统（移植自 Materialize 模板）
+// 紫色系 / 圆角卡片 / 深色暗色主题
+// ============================================================================
+
+// ---------- 配色系统（对齐 Materialize）----------
 :root {
+  // 主色（紫罗兰）
+  --primary-1: #f3effe;
+  --primary-2: #e8e0fe;
+  --primary-3: #d6c6fd;
+  --primary-4: #c1a8fc;
+  --primary-5: #a785fa;
+  --primary-6: #8c57ff;
+  --primary-7: #7340e0;
+  --primary-8: #5a30c0;
+  --primary-9: #4320a0;
+  --primary-10: #2d1080;
+
+  // 功能色（对齐 Materialize）
+  --success-6: #56ca00;
+  --warning-6: #ffb400;
+  --danger-6: #ff4c51;
+  --info-6: #16b1ff;
+
+  // 背景
   --color-bg-1: #ffffff;
-  --color-bg-2: #f7f8fa;
-  --color-bg-3: #f2f3f5;
-  --color-border-1: #e5e6eb;
-  --color-text-1: #1d2129;
-  --color-text-2: #4e5969;
-  --color-text-3: #86909c;
-  --color-primary: rgb(var(--primary-6, 20, 120, 252));
-  --color-success: rgb(var(--success-6, 0, 180, 42));
-  --color-warning: rgb(var(--warning-6, 255, 125, 0));
-  --color-danger: rgb(var(--danger-6, 245, 63, 63));
-  --color-info: rgb(var(--arcoblue-6, 20, 120, 252));
-  --navbar-height: 60px;
-  --menu-width: 220px;
-  --menu-collapsed-width: 48px;
-  --card-border-radius: 12px;
-  --card-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-  --card-shadow-hover: 0 8px 24px rgba(0, 0, 0, 0.12);
+  --color-bg-2: #f8f7fa;
+  --color-bg-3: #f2f0f5;
+  --color-bg-4: #ebe8f0;
+  --color-border-1: #eae9ec;
+  --color-border-2: #d5d4d8;
+  --color-border-3: #c0bec5;
+
+  // 文字
+  --color-text-1: #2e263d;
+  --color-text-2: #433c50;
+  --color-text-3: #6d6777;
+  --color-text-4: #827d8b;
+
+  // 尺寸
+  --navbar-height: 64px;
+  --menu-width: 260px;
+  --menu-collapsed-width: 64px;
+  --card-radius: 10px;
+  --card-shadow: 0 2px 8px rgba(46, 38, 61, 0.06);
+  --card-shadow-hover: 0 8px 24px rgba(46, 38, 61, 0.12);
+
+  // Arco 主题色覆盖
+  --primary-6: 140, 87, 255;
 }
 
+// ---------- Dark 主题（Materialize 深紫黑）----------
 body[arco-theme='dark'] {
-  --color-bg-1: #17171a;
-  --color-bg-2: #0d1117;
-  --color-bg-3: #232324;
-  --color-border-1: #333335;
-  --color-text-1: #f7f8fa;
-  --color-text-2: #c9cdd4;
-  --color-text-3: #86909c;
+  --color-bg-1: #28243d;
+  --color-bg-2: #2c2842;
+  --color-bg-3: #403c5a;
+  --color-bg-4: #4d4868;
+  --color-border-1: #403c5a;
+  --color-border-2: #686480;
+  --color-border-3: #7a7692;
+
+  --color-text-1: #e7e3fc;
+  --color-text-2: #c3bfd9;
+  --color-text-3: #b0acc7;
+  --color-text-4: #7a7692;
+
   --card-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
   --card-shadow-hover: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
 
-html,
-body,
-#app {
+// ---------- 基础重置 ----------
+html, body, #app {
   height: 100%;
   margin: 0;
   padding: 0;
 }
 
 body {
-  font-family:
-    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC',
-    'Hiragino Sans GB', 'Microsoft YaHei', Helvetica, Arial, sans-serif;
+  font-family: 'Public Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    Roboto, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+    Helvetica, Arial, sans-serif;
   background-color: var(--color-bg-2);
   color: var(--color-text-1);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  font-size: 14px;
+  line-height: 1.5;
 }
 
 a {
-  color: inherit;
+  color: rgb(var(--primary-6));
   text-decoration: none;
+  transition: color 0.2s;
+  &:hover { color: var(--primary-7); }
 }
 
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-::-webkit-scrollbar-thumb {
-  background: var(--color-text-3);
-  border-radius: 4px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: var(--color-text-2);
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
+// ---------- 滚动条 ----------
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: var(--color-border-3); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-text-4); }
+::-webkit-scrollbar-track { background: transparent; }
 
-// 通用容器
+// ---------- 通用容器 ----------
 .page-container {
-  padding: 20px 24px;
+  padding: 24px;
   min-height: calc(100vh - var(--navbar-height));
   box-sizing: border-box;
   max-width: 1600px;
   margin: 0 auto;
 }
 
-.card-grid {
-  display: grid;
-  gap: 16px;
-}
-
-.flex {
-  display: flex;
-}
-.flex-center {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.flex-between {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.mt-8 { margin-top: 8px; }
-.mt-16 { margin-top: 16px; }
-.mt-24 { margin-top: 24px; }
-.mb-8 { margin-bottom: 8px; }
-.mb-16 { margin-bottom: 16px; }
-.ml-8 { margin-left: 8px; }
-.mr-8 { margin-right: 8px; }
-
-// ---------- 美观提升：卡片 ----------
+// ---------- 卡片（核心视觉元素）----------
 .arco-card {
-  border-radius: var(--card-border-radius);
+  border-radius: var(--card-radius) !important;
   box-shadow: var(--card-shadow);
+  border: none !important;
   transition: box-shadow 0.25s ease, transform 0.25s ease;
   &:hover {
     box-shadow: var(--card-shadow-hover);
@@ -118,66 +124,121 @@ a {
   }
 }
 
-// ---------- 美观提升：按钮 ----------
+body[arco-theme='dark'] .arco-card {
+  background-color: var(--color-bg-2) !important;
+}
+
+// ---------- 按钮（渐变主色）----------
 .arco-btn-primary {
-  background: linear-gradient(135deg, rgb(var(--primary-6)), rgb(var(--primary-5)));
-  border: none;
+  background: linear-gradient(135deg, var(--primary-6), var(--primary-5));
+  border: none !important;
   &:hover {
-    background: linear-gradient(135deg, rgb(var(--primary-5)), rgb(var(--primary-4)));
+    background: linear-gradient(135deg, var(--primary-5), var(--primary-4));
   }
 }
 
-// ---------- 美观提升：菜单 ----------
+// ---------- 菜单（圆角 hover）----------
 .arco-menu-item {
-  border-radius: 6px;
-  margin: 2px 8px;
-  transition: background-color 0.2s ease;
+  border-radius: 8px;
+  margin: 2px 10px;
+  transition: all 0.2s ease;
   &:hover {
     background-color: var(--color-bg-3);
   }
 }
+.arco-menu-selected {
+  background: linear-gradient(135deg, rgba(140, 87, 255, 0.1), rgba(140, 87, 255, 0.05)) !important;
+  color: var(--primary-6) !important;
+  font-weight: 500;
+}
 
-// ---------- 美观提升：表格 ----------
+// ---------- 表格 ----------
 .arco-table {
-  border-radius: var(--card-border-radius);
+  border-radius: var(--card-radius);
   overflow: hidden;
-}
-
-// ---------- 美观提升：标签 ----------
-.arco-tag {
-  border-radius: 4px;
-}
-
-// ---------- 美观提升：暗色毛玻璃 ----------
-body[arco-theme='dark'] {
-  .arco-layout-sider {
-    background-color: rgba(23, 23, 26, 0.85);
-    backdrop-filter: blur(12px);
-  }
-  .arco-layout-header {
-    background-color: rgba(23, 23, 26, 0.85);
-    backdrop-filter: blur(12px);
+  .arco-table-th {
+    background-color: var(--color-bg-3) !important;
+    font-weight: 600;
   }
 }
 
-// ---------- 路由切换动画：fade + slide ----------
-.fade-enter-active,
-.fade-leave-active {
-  transition: opacity 0.25s ease, transform 0.25s ease;
-}
-.fade-enter-from {
-  opacity: 0;
-  transform: translateX(10px);
-}
-.fade-leave-to {
-  opacity: 0;
-  transform: translateX(-10px);
-}
-
-// ---------- 渐变 Logo ----------
+// ---------- 品牌渐变 Logo ----------
 .logo-text {
-  background: linear-gradient(135deg, rgb(var(--primary-6)), #0fc6c2);
+  background: linear-gradient(135deg, var(--primary-6), #16b1ff);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
+
+// ---------- 渐变背景工具类 ----------
+.bg-gradient-primary {
+  background: linear-gradient(135deg, var(--primary-6), var(--primary-4));
+}
+.bg-gradient-success {
+  background: linear-gradient(135deg, #56ca00, #82e040);
+}
+.bg-gradient-warning {
+  background: linear-gradient(135deg, #ffb400, #ffd040);
+}
+.bg-gradient-danger {
+  background: linear-gradient(135deg, #ff4c51, #ff8083);
+}
+.bg-gradient-info {
+  background: linear-gradient(135deg, #16b1ff, #56d0ff);
+}
+
+// ---------- 暗色毛玻璃侧栏 ----------
+body[arco-theme='dark'] {
+  .arco-layout-sider {
+    background-color: rgba(40, 36, 61, 0.85);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+  }
+  .arco-layout-header {
+    background-color: rgba(40, 36, 61, 0.85);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+  }
+}
+
+// ---------- 路由切换动画 ----------
+.fade-enter-active, .fade-leave-active {
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+.fade-enter-from {
+  opacity: 0;
+  transform: translateY(8px);
+}
+.fade-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
+}
+
+// ---------- 统计数字（大号渐变）----------
+.stat-number {
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.2;
+  &.text-primary { color: var(--primary-6); }
+  &.text-success { color: var(--success-6); }
+  &.text-warning { color: var(--warning-6); }
+  &.text-danger { color: var(--danger-6); }
+}
+
+// ---------- 标签徽章（圆角药丸）----------
+.arco-tag {
+  border-radius: 6px;
+  font-weight: 500;
+}
+
+// ---------- 页头间距工具类 ----------
+.mt-8 { margin-top: 8px; }
+.mt-16 { margin-top: 16px; }
+.mt-24 { margin-top: 24px; }
+.mb-8 { margin-bottom: 8px; }
+.mb-16 { margin-bottom: 16px; }
+.mb-24 { margin-bottom: 24px; }
+.ml-8 { margin-left: 8px; }
+.mr-8 { margin-right: 8px; }
+.gap-8 { gap: 8px; }
+.gap-16 { gap: 16px; }

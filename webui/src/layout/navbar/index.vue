@@ -1,17 +1,21 @@
 <template>
-  <div class="navbar">
+  <div class="layout-navbar">
+    <!-- 左侧：折叠按钮 + 面包屑 -->
     <div class="navbar-left">
       <a-button type="text" shape="circle" @click="appStore.menuCollapse = !appStore.menuCollapse">
-        <icon-menu-fold v-if="!appStore.menuCollapse" />
-        <icon-menu-unfold v-else />
+        <template #icon>
+          <icon-menu-fold v-if="!appStore.menuCollapse" />
+          <icon-menu-unfold v-else />
+        </template>
       </a-button>
-      <a-breadcrumb class="breadcrumb">
+      <a-breadcrumb class="navbar-breadcrumb">
         <a-breadcrumb-item v-for="item in breadcrumbs" :key="item.path">
           {{ item.label }}
         </a-breadcrumb-item>
       </a-breadcrumb>
     </div>
 
+    <!-- 中间：搜索 -->
     <div class="navbar-center">
       <a-input-search
         v-model="searchQuery"
@@ -22,42 +26,35 @@
       />
     </div>
 
+    <!-- 右侧：通知 + 主题 + 设置 + 用户 -->
     <div class="navbar-right">
-      <!-- 待审批通知 -->
-      <a-badge :count="pendingApprovals" :offset="[-4, 4]" dot>
-        <a-button type="text" shape="circle" @click="goApprovals">
+      <a-badge :count="pendingApprovals" :max-count="99" dot>
+        <a-button type="text" shape="circle" @click="$router.push('/approvals/instances')">
           <icon-notification />
         </a-button>
       </a-badge>
 
-      <!-- 主题切换 -->
-      <a-tooltip :content="appStore.isDark ? '切换到浅色' : '切换到深色'">
+      <a-tooltip :content="appStore.isDark ? '浅色模式' : '深色模式'">
         <a-button type="text" shape="circle" @click="appStore.toggleDark()">
           <icon-moon-fill v-if="!appStore.isDark" />
           <icon-sun-fill v-else />
         </a-button>
       </a-tooltip>
 
-      <!-- 设置抽屉 -->
-      <a-button type="text" shape="circle" @click="settingVisible = true">
-        <icon-settings />
-      </a-button>
-
-      <!-- 用户下拉 -->
       <a-dropdown trigger="click">
-        <div class="user-info">
-          <a-avatar :size="30" :style="{ backgroundColor: '#165dff' }">
+        <div class="navbar-user">
+          <div class="user-avatar" :style="{ background: 'linear-gradient(135deg, #8c57ff, #16b1ff)' }">
             {{ (userStore.user?.displayName || 'U').charAt(0) }}
-          </a-avatar>
-          <span class="username">{{ userStore.user?.displayName || '未登录' }}</span>
+          </div>
+          <span class="user-name">{{ userStore.user?.displayName || '未登录' }}</span>
           <a-tag v-if="userStore.user" :color="roleColor" size="small">{{ roleLabel }}</a-tag>
         </div>
         <template #content>
           <a-doption @click="$router.push('/settings')">
-            <template #icon><icon-user /></template>
+            <template #icon><icon-settings /></template>
             个人设置
           </a-doption>
-          <a-doption @click="$router.push('/users')" v-if="userStore.isAdmin">
+          <a-doption v-if="userStore.isAdmin" @click="$router.push('/users')">
             <template #icon><icon-user-group /></template>
             用户管理
           </a-doption>
@@ -68,8 +65,6 @@
         </template>
       </a-dropdown>
     </div>
-
-    <global-setting-trigger v-model:visible="settingVisible" />
   </div>
 </template>
 
@@ -79,7 +74,6 @@ import { useRouter, useRoute } from 'vue-router';
 import { useAppStore } from '@/stores/app';
 import { useUserStore } from '@/stores/user';
 import { rpc } from '@/api/rpc';
-import GlobalSettingTrigger from './global-setting-trigger.vue';
 
 const router = useRouter();
 const route = useRoute();
@@ -87,7 +81,6 @@ const appStore = useAppStore();
 const userStore = useUserStore();
 
 const searchQuery = ref('');
-const settingVisible = ref(false);
 const pendingApprovals = ref(0);
 
 const roleLabel = computed(() => {
@@ -106,28 +99,18 @@ const roleColor = computed(() => {
   return map[userStore.role] || 'gray';
 });
 
-const breadcrumbs = computed(() => {
-  return route.matched
-    .filter((r) => r.meta?.label)
-    .map((r) => ({ path: r.path, label: r.meta.label as string }));
-});
+const breadcrumbs = computed(() =>
+  route.matched.filter((r) => r.meta?.label).map((r) => ({ path: r.path, label: r.meta.label as string }))
+);
 
 function onSearch(v: string) {
-  if (!v) return;
-  router.push({ path: '/sessions', query: { q: v } });
-}
-
-function goApprovals() {
-  router.push('/approvals/instances');
+  if (v) router.push({ path: '/sessions', query: { q: v } });
 }
 
 function onLogout() {
   userStore.logout();
   router.push('/login');
 }
-
-let unsub: (() => void) | null = null;
-let timer: any = null;
 
 async function refreshPending() {
   try {
@@ -136,25 +119,21 @@ async function refreshPending() {
   } catch { /* ignore */ }
 }
 
+let timer: any = null;
 onMounted(() => {
   refreshPending();
-  timer = setInterval(refreshPending, 15000);
-  unsub = rpc.on('approval.instance.created', refreshPending);
+  timer = setInterval(refreshPending, 30000);
 });
-
-onUnmounted(() => {
-  if (timer) clearInterval(timer);
-  if (unsub) unsub();
-});
+onUnmounted(() => { if (timer) clearInterval(timer); });
 </script>
 
 <style lang="less" scoped>
-.navbar {
+.layout-navbar {
   height: var(--navbar-height);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 20px;
+  padding: 0 24px;
   gap: 16px;
 }
 
@@ -162,7 +141,10 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 12px;
-  flex: 1;
+}
+
+.navbar-breadcrumb {
+  font-size: 14px;
 }
 
 .navbar-center {
@@ -175,22 +157,32 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex: 1;
-  justify-content: flex-end;
 }
 
-.user-info {
+.navbar-user {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 10px;
-  border-radius: 20px;
+  padding: 6px 12px;
+  border-radius: 10px;
   cursor: pointer;
   transition: background 0.2s;
-  &:hover {
-    background-color: var(--color-bg-3);
+  &:hover { background-color: var(--color-bg-3); }
+
+  .user-avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-weight: 600;
+    font-size: 14px;
+    flex-shrink: 0;
   }
-  .username {
+
+  .user-name {
     font-size: 14px;
     color: var(--color-text-1);
     font-weight: 500;

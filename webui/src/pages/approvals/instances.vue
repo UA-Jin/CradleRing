@@ -153,12 +153,12 @@ const comment = ref('');
 
 const stats = ref<any>({});
 const statCards = [
-  { key: 'total', label: '总数', color: '#165dff' },
-  { key: 'pending', label: '待审批', color: '#ff7d00' },
-  { key: 'approved', label: '已批准', color: '#00b42a' },
-  { key: 'rejected', label: '已拒绝', color: '#f53f3f' },
-  { key: 'timeout', label: '超时', color: '#86909c' },
-  { key: 'completed', label: '已完成', color: '#722ed1' },
+  { key: 'total', label: '总数', color: '#8c57ff' },
+  { key: 'pending', label: '待审批', color: '#ffb400' },
+  { key: 'approved', label: '已批准', color: '#56ca00' },
+  { key: 'rejected', label: '已拒绝', color: '#ff4c51' },
+  { key: 'timeout', label: '超时', color: '#6d6777' },
+  { key: 'completed', label: '已完成', color: '#7340e0' },
 ];
 
 async function load() {
