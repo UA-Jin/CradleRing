@@ -152,16 +152,30 @@ is_curl_bash_mode() {
     [[ ! -f "$SCRIPT_DIR/Cargo.toml" ]]
 }
 
-# 从 GitHub 克隆源码到临时目录
+# 从 GitHub 下载源码到临时目录（优先 git，fallback 到 curl tarball）
 clone_source() {
     local tmp_dir
     tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t 'cradlering')"
-    ui_step "从 GitHub 下载源码..."
-    if [[ -d "$tmp_dir/.git" ]]; then
-        cd "$tmp_dir" && git fetch --all 2>/dev/null && git checkout main 2>/dev/null || true
+    # 日志输出到 stderr，不干扰返回值
+    echo -e "${ACCENT}${BOLD}▸ 从 GitHub 下载源码...${NC}" >&2
+    # 优先用 git（如果可用）
+    if command -v git >/dev/null 2>&1; then
+        if [[ -d "$tmp_dir/.git" ]]; then
+            cd "$tmp_dir" && git fetch --all 2>/dev/null && git checkout main 2>/dev/null || true
+        else
+            git clone --depth 1 https://github.com/UA-Jin/CradleRing.git "$tmp_dir" >&2 || { ui_error "克隆失败" >&2; exit 1; }
+        fi
     else
-        git clone --depth 1 https://github.com/UA-Jin/CradleRing.git "$tmp_dir" || { ui_error "克隆失败"; exit 1; }
+        # fallback：用 curl 下载 tarball（无需 git）
+        echo -e "${INFO}git 不可用，改用 curl 下载源码包...${NC}" >&2
+        local tarball="$tmp_dir/cradlering.tar.gz"
+        curl -fsSL -o "$tarball" https://github.com/UA-Jin/CradleRing/archive/refs/heads/main.tar.gz >&2 || { ui_error "下载失败" >&2; exit 1; }
+        tar -xzf "$tarball" -C "$tmp_dir" >&2 || { ui_error "解压失败" >&2; exit 1; }
+        # 把解压后的子目录内容移到顶层
+        mv "$tmp_dir"/CradleRing-main/* "$tmp_dir/" 2>/dev/null || true
+        rm -rf "$tmp_dir"/CradleRing-main "$tarball" 2>/dev/null || true
     fi
+    # 只输出路径到 stdout（供 $( ) 捕获）
     echo "$tmp_dir"
 }
 
@@ -170,8 +184,8 @@ install_cradle_ring() {
     local src_dir="$SCRIPT_DIR"
     # curl|bash 模式：自动从 GitHub 克隆源码
     if is_curl_bash_mode; then
-        ui_info "检测到 curl|bash 模式，自动下载源码..."
-        src_dir="$(clone_source)"
+        echo -e "${INFO}检测到 curl|bash 模式，自动下载源码...${NC}" >&2
+        src_dir="$(clone_source)"; echo "DEBUG: src_dir=[$src_dir]" >&2
         TMPFILES+=("$src_dir")
         SRC_DIR="$src_dir"  # 保存到全局变量，供后续步骤使用
     fi
