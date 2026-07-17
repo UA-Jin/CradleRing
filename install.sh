@@ -146,6 +146,46 @@ ensure_rust_toolchain() {
     ui_success "Rust: $RUSTC_VERSION"
 }
 
+# 确保 C 编译器（gcc/cc）可用，Rust 编译需要
+ensure_c_toolchain() {
+    if command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; then
+        return 0
+    fi
+    ui_warn "未检测到 C 编译器（cc/gcc），Rust 编译需要它"
+    ui_step "安装 C 编译器..."
+    if [[ "$DRY_RUN" == "1" ]]; then return 0; fi
+    # 检测包管理器并安装
+    if command -v apt-get >/dev/null 2>&1; then
+        # Debian/Ubuntu
+        apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential pkg-config libssl-dev 2>&1 | tail -3 || { ui_error "build-essential 安装失败"; exit 1; }
+    elif command -v yum >/dev/null 2>&1; then
+        # CentOS/RHEL/Fedora
+        yum install -y -q gcc gcc-c++ make pkgconfig openssl-devel 2>&1 | tail -3 || { ui_error "gcc 安装失败"; exit 1; }
+    elif command -v dnf >/dev/null 2>&1; then
+        # Fedora
+        dnf install -y -q gcc gcc-c++ make pkgconfig openssl-devel 2>&1 | tail -3 || { ui_error "gcc 安装失败"; exit 1; }
+    elif command -v apk >/dev/null 2>&1; then
+        # Alpine
+        apk add --no-cache build-base pkgconfig openssl-dev 2>&1 | tail -3 || { ui_error "build-base 安装失败"; exit 1; }
+    elif command -v pacman >/dev/null 2>&1; then
+        # Arch
+        pacman -S --noconfirm base-devel openssl 2>&1 | tail -3 || { ui_error "base-devel 安装失败"; exit 1; }
+    else
+        ui_error "无法检测包管理器，请手动安装 C 编译器（gcc/build-essential）"
+        ui_info "  Debian/Ubuntu: apt-get install build-essential pkg-config libssl-dev"
+        ui_info "  CentOS/RHEL:   yum install gcc gcc-c++ make pkgconfig openssl-devel"
+        ui_info "  Alpine:        apk add build-base pkgconfig openssl-dev"
+        exit 1
+    fi
+    # 验证安装
+    if ! command -v cc >/dev/null 2>&1 && ! command -v gcc >/dev/null 2>&1; then
+        ui_error "C 编译器安装后仍无法检测"
+        exit 1
+    fi
+    ui_success "C 编译器已安装"
+}
+
 # 检测是否在 curl|bash 模式下运行（无本地源码）
 is_curl_bash_mode() {
     # 如果 SCRIPT_DIR 下没有 Cargo.toml，说明是通过 curl 下载的脚本
@@ -507,6 +547,7 @@ main() {
     print_banner
     detect_os_or_die
     ensure_rust_toolchain
+    ensure_c_toolchain
     install_cradle_ring
     build_webui
     install_binary_and_ui
