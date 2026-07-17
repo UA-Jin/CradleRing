@@ -1,0 +1,42 @@
+// Public barrel for shared terminal formatting helpers.
+// 翻译自 packages/terminal-core/src/index.ts
+
+pub mod ansi;
+pub mod decorative_emoji;
+pub mod display_string;
+pub mod health_style;
+pub mod links;
+pub mod note;
+pub mod osc_progress;
+pub mod palette;
+pub mod progress_line;
+pub mod prompt_select_styled;
+pub mod prompt_select_styled_params;
+pub mod prompt_style;
+pub mod restore;
+pub mod safe_text;
+pub mod stream_writer;
+pub mod string;
+pub mod table;
+pub mod terminal_link;
+pub mod theme;
+
+pub use ansi::*;
+pub use decorative_emoji::*;
+pub use display_string::*;
+pub use health_style::*;
+pub use links::*;
+pub use note::*;
+pub use osc_progress::*;
+pub use palette::*;
+pub use progress_line::*;
+pub use prompt_select_styled::*;
+pub use prompt_select_styled_params::*;
+pub use prompt_style::*;
+pub use restore::*;
+pub use safe_text::*;
+pub use stream_writer::*;
+pub use string::*;
+pub use table::*;
+pub use terminal_link::*;
+pub use theme::*;

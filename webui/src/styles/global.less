@@ -1,0 +1,183 @@
+@import '@arco-design/web-vue/es/style/theme/index.less';
+
+// ---------- 全局 CSS 变量：对齐 Arco Pro Vue 的 token 体系 ----------
+:root {
+  --color-bg-1: #ffffff;
+  --color-bg-2: #f7f8fa;
+  --color-bg-3: #f2f3f5;
+  --color-border-1: #e5e6eb;
+  --color-text-1: #1d2129;
+  --color-text-2: #4e5969;
+  --color-text-3: #86909c;
+  --color-primary: rgb(var(--primary-6, 20, 120, 252));
+  --color-success: rgb(var(--success-6, 0, 180, 42));
+  --color-warning: rgb(var(--warning-6, 255, 125, 0));
+  --color-danger: rgb(var(--danger-6, 245, 63, 63));
+  --color-info: rgb(var(--arcoblue-6, 20, 120, 252));
+  --navbar-height: 60px;
+  --menu-width: 220px;
+  --menu-collapsed-width: 48px;
+  --card-border-radius: 12px;
+  --card-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --card-shadow-hover: 0 8px 24px rgba(0, 0, 0, 0.12);
+}
+
+body[arco-theme='dark'] {
+  --color-bg-1: #17171a;
+  --color-bg-2: #0d1117;
+  --color-bg-3: #232324;
+  --color-border-1: #333335;
+  --color-text-1: #f7f8fa;
+  --color-text-2: #c9cdd4;
+  --color-text-3: #86909c;
+  --card-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  --card-shadow-hover: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', Helvetica, Arial, sans-serif;
+  background-color: var(--color-bg-2);
+  color: var(--color-text-1);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-text-3);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-2);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+// 通用容器
+.page-container {
+  padding: 20px 24px;
+  min-height: calc(100vh - var(--navbar-height));
+  box-sizing: border-box;
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+.card-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.flex {
+  display: flex;
+}
+.flex-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.flex-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.mt-8 { margin-top: 8px; }
+.mt-16 { margin-top: 16px; }
+.mt-24 { margin-top: 24px; }
+.mb-8 { margin-bottom: 8px; }
+.mb-16 { margin-bottom: 16px; }
+.ml-8 { margin-left: 8px; }
+.mr-8 { margin-right: 8px; }
+
+// ---------- 美观提升：卡片 ----------
+.arco-card {
+  border-radius: var(--card-border-radius);
+  box-shadow: var(--card-shadow);
+  transition: box-shadow 0.25s ease, transform 0.25s ease;
+  &:hover {
+    box-shadow: var(--card-shadow-hover);
+    transform: translateY(-2px);
+  }
+}
+
+// ---------- 美观提升：按钮 ----------
+.arco-btn-primary {
+  background: linear-gradient(135deg, rgb(var(--primary-6)), rgb(var(--primary-5)));
+  border: none;
+  &:hover {
+    background: linear-gradient(135deg, rgb(var(--primary-5)), rgb(var(--primary-4)));
+  }
+}
+
+// ---------- 美观提升：菜单 ----------
+.arco-menu-item {
+  border-radius: 6px;
+  margin: 2px 8px;
+  transition: background-color 0.2s ease;
+  &:hover {
+    background-color: var(--color-bg-3);
+  }
+}
+
+// ---------- 美观提升：表格 ----------
+.arco-table {
+  border-radius: var(--card-border-radius);
+  overflow: hidden;
+}
+
+// ---------- 美观提升：标签 ----------
+.arco-tag {
+  border-radius: 4px;
+}
+
+// ---------- 美观提升：暗色毛玻璃 ----------
+body[arco-theme='dark'] {
+  .arco-layout-sider {
+    background-color: rgba(23, 23, 26, 0.85);
+    backdrop-filter: blur(12px);
+  }
+  .arco-layout-header {
+    background-color: rgba(23, 23, 26, 0.85);
+    backdrop-filter: blur(12px);
+  }
+}
+
+// ---------- 路由切换动画：fade + slide ----------
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.25s ease, transform 0.25s ease;
+}
+.fade-enter-from {
+  opacity: 0;
+  transform: translateX(10px);
+}
+.fade-leave-to {
+  opacity: 0;
+  transform: translateX(-10px);
+}
+
+// ---------- 渐变 Logo ----------
+.logo-text {
+  background: linear-gradient(135deg, rgb(var(--primary-6)), #0fc6c2);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}

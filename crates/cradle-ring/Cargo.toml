@@ -1,0 +1,62 @@
+[package]
+name = "cradle-ring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cradle-ring"
+path = "src/main.rs"
+
+[lib]
+name = "cradle_ring"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+regex.workspace = true
+async-stream.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+futures = "0.3"
+tokio.workspace = true
+anyhow = "1.0"
+once_cell = "1"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+base64 = "0.22"
+url = "2"
+rand = "0.8"
+thiserror = "1"
+tracing = "0.1"
+lazy_static = "1"
+flate2 = "1"
+tokio-util = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+aes-gcm = "0.10"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# 内部 packages
+normalization-core = { path = "../../packages/normalization-core" }
+gateway-protocol = { path = "../../packages/gateway-protocol" }
+markdown-core = { path = "../../packages/markdown-core" }
+web-content-core = { path = "../../packages/web-content-core" }
+media-core = { path = "../../packages/media-core" }
+media-understanding-common = { path = "../../packages/media-understanding-common" }
+speech-core = { path = "../../packages/speech-core" }
+tool-call-repair = { path = "../../packages/tool-call-repair" }
+llm-core = { path = "../../packages/llm-core" }
+model-catalog-core = { path = "../../packages/model-catalog-core" }
+terminal-core = { path = "../../packages/terminal-core" }
+sdk = { path = "../../packages/sdk" }
+media-generation-core = { path = "../../packages/media-generation-core" }
+plugin-sdk = { path = "../../packages/plugin-sdk" }
+net-policy = { path = "../../packages/net-policy" }
+plugin-package-contract = { path = "../../packages/plugin-package-contract" }
+acp-core = { path = "../../packages/acp-core" }
+agent-core = { path = "../../packages/agent-core" }
+gateway-client = { path = "../../packages/gateway-client" }
+memory-host-sdk = { path = "../../packages/memory-host-sdk" }
+ai = { path = "../../packages/ai" }

@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "packages/normalization-core",
+    "packages/gateway-protocol",
+    "packages/markdown-core",
+    "packages/web-content-core",
+    "packages/media-core",
+    "packages/media-understanding-common",
+    "packages/speech-core",
+    "packages/tool-call-repair",
+    "packages/llm-core",
+    "packages/model-catalog-core",
+    "packages/terminal-core",
+    "packages/sdk",
+    "packages/media-generation-core",
+    "packages/plugin-sdk",
+    "packages/net-policy",
+    "packages/plugin-package-contract",
+    "packages/acp-core",
+    "packages/agent-core",
+    "packages/gateway-client",
+    "packages/memory-host-sdk",
+    "packages/ai",
+    "crates/cradle-ring",
+]
+
+[workspace.package]
+version = "2026.7.2"
+edition = "2021"
+authors = ["CradleRing"]
+license = "MIT"
+repository = "https://github.com/cradle-ring/cradle-ring"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.10"
+async-stream = "0.3"
+futures-core = "0.3"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "fs", "process", "io-util", "time"] }

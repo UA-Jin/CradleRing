@@ -1,0 +1,12 @@
+[package]
+name = "terminal-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+once_cell = "1"
+unicode-segmentation = "1"
