@@ -42,6 +42,7 @@ SYSTEMD_SERVICE="cradle-ring-gateway"
 LAUNCHD_LABEL="dev.cradle-ring.gateway"
 
 TMPFILES=()
+SRC_DIR=""  # 全局变量：记录源码目录（curl|bash 模式下为克隆的临时目录）
 cleanup_tmpfiles() { for f in "${TMPFILES[@]:-}"; do rm -rf "$f" 2>/dev/null || true; done; }
 trap cleanup_tmpfiles EXIT
 trap 'cleanup_tmpfiles; ui_warn "安装中断"; exit 130' INT
@@ -145,23 +146,50 @@ ensure_rust_toolchain() {
     ui_success "Rust: $RUSTC_VERSION"
 }
 
+# 检测是否在 curl|bash 模式下运行（无本地源码）
+is_curl_bash_mode() {
+    # 如果 SCRIPT_DIR 下没有 Cargo.toml，说明是通过 curl 下载的脚本
+    [[ ! -f "$SCRIPT_DIR/Cargo.toml" ]]
+}
+
+# 从 GitHub 克隆源码到临时目录
+clone_source() {
+    local tmp_dir
+    tmp_dir="$(mktemp -d 2>/dev/null || mktemp -d -t 'cradlering')"
+    ui_step "从 GitHub 下载源码..."
+    if [[ -d "$tmp_dir/.git" ]]; then
+        cd "$tmp_dir" && git fetch --all 2>/dev/null && git checkout main 2>/dev/null || true
+    else
+        git clone --depth 1 https://github.com/UA-Jin/CradleRing.git "$tmp_dir" || { ui_error "克隆失败"; exit 1; }
+    fi
+    echo "$tmp_dir"
+}
+
 install_cradle_ring() {
     ui_step "编译 CradleRing（cargo build --release）..."
+    local src_dir="$SCRIPT_DIR"
+    # curl|bash 模式：自动从 GitHub 克隆源码
+    if is_curl_bash_mode; then
+        ui_info "检测到 curl|bash 模式，自动下载源码..."
+        src_dir="$(clone_source)"
+        TMPFILES+=("$src_dir")
+        SRC_DIR="$src_dir"  # 保存到全局变量，供后续步骤使用
+    fi
     case "$INSTALL_METHOD" in
-        cargo|source)
-            if [[ -f "$SCRIPT_DIR/Cargo.toml" ]]; then
-                ui_info "当前目录编译: $SCRIPT_DIR"
+        cargo|source|"")
+            if [[ -f "$src_dir/Cargo.toml" ]]; then
+                ui_info "源码目录: $src_dir"
                 [[ "$DRY_RUN" == "1" ]] && return 0
-                cd "$SCRIPT_DIR"
+                cd "$src_dir"
                 cargo build --release --bin cradle-ring || { ui_error "编译失败"; exit 1; }
-                BINARY="$SCRIPT_DIR/target/release/cradle-ring"
+                BINARY="$src_dir/target/release/cradle-ring"
             else
                 [[ "$DRY_RUN" == "1" ]] && return 0
                 cargo install cradle-ring --locked --force 2>/dev/null || {
                     ui_warn "crates.io 未发布，从源码编译"
-                    [[ -d "$SCRIPT_DIR/crates" ]] && cd "$SCRIPT_DIR" && cargo build --release --bin cradle-ring || { ui_error "编译失败"; exit 1; }
+                    [[ -d "$src_dir/crates" ]] && cd "$src_dir" && cargo build --release --bin cradle-ring || { ui_error "编译失败"; exit 1; }
                 }
-                BINARY="$SCRIPT_DIR/target/release/cradle-ring"
+                BINARY="$src_dir/target/release/cradle-ring"
             fi ;;
         git)
             local repo_dir="$HOME_DIR/repo"
@@ -170,7 +198,7 @@ install_cradle_ring() {
             if [[ -d "$repo_dir/.git" ]]; then
                 cd "$repo_dir"; git fetch --all 2>/dev/null; git checkout "$VERSION" 2>/dev/null || true
             else
-                git clone "https://github.com/cradle-ring/cradle-ring.git" "$repo_dir" || { ui_error "克隆失败"; exit 1; }
+                git clone "https://github.com/UA-Jin/CradleRing.git" "$repo_dir" || { ui_error "克隆失败"; exit 1; }
                 cd "$repo_dir"; git checkout "$VERSION" 2>/dev/null || true
             fi
             cargo build --release --bin cradle-ring || { ui_error "编译失败"; exit 1; }
@@ -182,7 +210,11 @@ install_cradle_ring() {
 
 # 构建前端（Vue3 + Arco Design Pro）
 build_webui() {
-    local webui_dir="$SCRIPT_DIR/webui"
+    local src_dir="$SRC_DIR"
+    if [[ -z "$src_dir" ]]; then
+        src_dir="$SCRIPT_DIR"
+    fi
+    local webui_dir="$src_dir/webui"
     if [[ ! -d "$webui_dir" ]] || [[ ! -f "$webui_dir/package.json" ]]; then
         ui_warn "未找到 webui/ 目录，跳过前端构建（将使用已有 ui-dist）"
         return 0
@@ -212,8 +244,8 @@ build_webui() {
     if [[ -d "$webui_dir/dist/assets" ]]; then
         ui_success "前端构建完成 → $webui_dir/dist"
         # 同步到 ui-dist
-        rm -rf "$SCRIPT_DIR/crates/cradle-ring/ui-dist"
-        cp -r "$webui_dir/dist" "$SCRIPT_DIR/crates/cradle-ring/ui-dist"
+        rm -rf "$src_dir/crates/cradle-ring/ui-dist"
+        cp -r "$webui_dir/dist" "$src_dir/crates/cradle-ring/ui-dist"
         ui_info "已同步到 crates/cradle-ring/ui-dist"
     else
         ui_error "前端构建失败"
