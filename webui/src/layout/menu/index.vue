@@ -56,6 +56,10 @@ import {
   IconTrophy,
   IconLink,
   IconSafe,
+  IconFolder,
+  IconLayers,
+  IconEmail,
+  IconThunderbolt,
 } from '@arco-design/web-vue/es/icon';
 
 const props = defineProps<{
@@ -79,7 +83,7 @@ const MenuIcon = defineComponent({
       'icon-bookmark': IconBookmark,
       'icon-share-internal': IconShareInternal,
       'icon-history': IconHistory,
-      'icon-magic': IconTool,
+      'icon-magic': IconThunderbolt,
       'icon-tool': IconTool,
       'icon-robot': IconRobot,
       'icon-user-group': IconUserGroup,
@@ -92,6 +96,10 @@ const MenuIcon = defineComponent({
       'icon-trophy': IconTrophy,
       'icon-link': IconLink,
       'icon-safe': IconSafe,
+      'icon-folder': IconFolder,
+      'icon-layers': IconLayers,
+      'icon-email': IconEmail,
+      'icon-thunderbolt': IconThunderbolt,
     };
     return () => {
       const Comp = map[props.name];
@@ -117,7 +125,8 @@ function buildMenu(routes: RouteRecordRaw[], parentPath = ''): MenuItem[] {
   return routes
     .filter((r) => r.meta?.label && isAuth(r.meta, props.isAdmin))
     .map((r) => {
-      const fullPath = (parentPath + '/' + r.path).replace(/\/+/g, '/');
+      // 子路由用绝对路径（/memory）时直接使用，否则拼接 parentPath
+      const fullPath = r.path.startsWith('/') ? r.path : (parentPath + '/' + r.path).replace(/\/+/g, '/');
       return {
         fullPath,
         label: r.meta?.label as string,

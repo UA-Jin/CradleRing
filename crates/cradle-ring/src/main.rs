@@ -136,6 +136,148 @@ fn sha1_compute(input: &[u8]) -> [u8; 20] {
 }
 
 // ============================================================================
+// TOTP（RFC 6238）+ Base32 + HMAC-SHA1：纯 Rust，无外部 crate
+// ============================================================================
+
+const BASE32_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+/// Base32 编码（RFC 4648，无 padding）
+fn base32_encode(input: &[u8]) -> String {
+    let mut out = String::new();
+    let mut buffer: u32 = 0;
+    let mut bits_left = 0;
+    for &b in input {
+        buffer = (buffer << 8) | (b as u32);
+        bits_left += 8;
+        while bits_left >= 5 {
+            bits_left -= 5;
+            out.push(BASE32_ALPHABET[((buffer >> bits_left) & 0x1f) as usize] as char);
+        }
+    }
+    if bits_left > 0 {
+        out.push(BASE32_ALPHABET[((buffer << (5 - bits_left)) & 0x1f) as usize] as char);
+    }
+    out
+}
+
+/// Base32 解码（容忍小写、空格和 padding '='）
+fn base32_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut buffer: u32 = 0;
+    let mut bits_left: u32 = 0;
+    for ch in input.chars() {
+        if ch == '=' || ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' {
+            continue;
+        }
+        let upper = ch.to_ascii_uppercase();
+        let idx = BASE32_ALPHABET.iter().position(|&c| c as char == upper)?;
+        buffer = (buffer << 5) | (idx as u32);
+        bits_left += 5;
+        if bits_left >= 8 {
+            bits_left -= 8;
+            out.push(((buffer >> bits_left) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// HMAC-SHA1（RFC 2104），block size = 64 字节
+fn hmac_sha1(key: &[u8], message: &[u8]) -> [u8; 20] {
+    let block_size = 64;
+    let mut k = if key.len() > block_size {
+        sha1_compute(key).to_vec()
+    } else {
+        key.to_vec()
+    };
+    k.resize(block_size, 0);
+    let mut ipad = vec![0x36u8; block_size];
+    let mut opad = vec![0x5cu8; block_size];
+    for i in 0..block_size {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner_input = ipad;
+    inner_input.extend_from_slice(message);
+    let inner = sha1_compute(&inner_input);
+    let mut outer_input = opad;
+    outer_input.extend_from_slice(&inner);
+    sha1_compute(&outer_input)
+}
+
+/// HOTP：RFC 4226，返回 6 位数字
+fn hotp(key: &[u8], counter: u64) -> u32 {
+    let mut counter_bytes = [0u8; 8];
+    counter_bytes.copy_from_slice(&counter.to_be_bytes());
+    let hash = hmac_sha1(key, &counter_bytes);
+    let offset = (hash[hash.len() - 1] & 0x0f) as usize;
+    let truncated: u32 = (((hash[offset] & 0x7f) as u32) << 24)
+        | ((hash[offset + 1] as u32) << 16)
+        | ((hash[offset + 2] as u32) << 8)
+        | (hash[offset + 3] as u32);
+    truncated % 1_000_000
+}
+
+/// TOTP：RFC 6238，默认 30 秒时间窗口
+/// window=0 表示当前窗口；正数=未来窗口；负数=过去窗口（用于容差验证）
+fn totp_now(key: &[u8], window: i64) -> u32 {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let counter = ((now_secs / 30) + window) as u64;
+    hotp(key, counter)
+}
+
+/// 校验 6 位 TOTP 码：允许前后 1 个窗口容差
+fn totp_verify(key: &[u8], code: u32) -> bool {
+    for w in -1..=1 {
+        if totp_now(key, w) == code {
+            return true;
+        }
+    }
+    false
+}
+
+/// 生成 6 位数字邮件验证码
+fn gen_email_code() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 4];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    let n = u32::from_le_bytes(buf) % 1_000_000;
+    format!("{:06}", n)
+}
+
+/// 生成新的 TOTP 密钥（20 字节随机 → base32）
+fn gen_totp_secret() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 20];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    base32_encode(&bytes)
+}
+
+/// 构建 otpauth URI（前端可据此生成二维码）
+fn build_totp_uri(secret: &str, account: &str, issuer: &str) -> String {
+    let issuer_enc = url_encode_simple(issuer);
+    let account_enc = url_encode_simple(account);
+    format!(
+        "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits=6&period=30",
+        issuer_enc, account_enc, secret, issuer_enc
+    )
+}
+
+fn url_encode_simple(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+// ============================================================================
 // 配置
 // ============================================================================
 
@@ -626,6 +768,15 @@ struct User {
     /// 个人偏好：是否启用审批流（普通用户可关闭）
     #[serde(default = "default_true")]
     approval_enabled: bool,
+    /// TOTP 共享密钥（base32，开启 2FA 时生成）
+    #[serde(default)]
+    totp_secret: Option<String>,
+    /// 是否已启用二步验证
+    #[serde(default)]
+    twofa_enabled: bool,
+    /// 二步验证方式：totp | email
+    #[serde(default)]
+    twofa_method: Option<String>,
 }
 
 fn default_role_operator() -> String { "operator".to_string() }
@@ -1974,6 +2125,8 @@ struct AppState {
     memory_engine: tokio::sync::OnceCell<Arc<MemoryEngine>>,
     /// 登录限流：username -> (连续失败次数, 锁定截止时间戳 ms)
     login_attempts: tokio::sync::Mutex<HashMap<String, (u32, i64)>>,
+    /// 二步验证码缓存：email -> (code, expires_at_ms)
+    twofa_codes: tokio::sync::Mutex<HashMap<String, (String, i64)>>,
     /// 运行时配置覆盖层：channels.set 等 RPC 修改配置后立即生效（无需重启）。
     /// 读取时与 config.raw_json 深度合并（override 优先）。
     config_override: tokio::sync::RwLock<serde_json::Value>,
@@ -1994,6 +2147,7 @@ impl AppState {
             current_user: tokio::sync::Mutex::new(None),
             memory_engine: tokio::sync::OnceCell::new(),
             login_attempts: tokio::sync::Mutex::new(HashMap::new()),
+            twofa_codes: tokio::sync::Mutex::new(HashMap::new()),
             config_override: tokio::sync::RwLock::new(serde_json::json!({})),
         });
         state
@@ -7189,6 +7343,9 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 created_at: current_ms(),
                 last_login: None,
                 approval_enabled: params["approvalEnabled"].as_bool().unwrap_or(true),
+                totp_secret: None,
+                twofa_enabled: false,
+                twofa_method: None,
             };
             let u_clone = user.clone();
             users.push(user);
@@ -8981,6 +9138,522 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             match execute_pipeline_run(state.clone(), &id, &input, &session_key).await {
                 Ok(result) => json!({"ok": true, "result": pipeline_result_to_json(&result)}),
                 Err(e) => json!({"ok": false, "error": {"message": e}}),
+            }
+        }
+
+        // ====================================================================
+        // 环境一键部署（env.*）：检测/安装/卸载运行环境
+        // ====================================================================
+        "env.list" => {
+            // 检测所有已知运行环境：返回安装状态、版本、二进制路径
+            async fn detect_one(cmd: &str, args: &[&str]) -> serde_json::Value {
+                let out = tokio::process::Command::new(cmd).args(args)
+                    .output().await;
+                match out {
+                    Ok(o) => {
+                        let combined = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                        let version = combined.lines().next().unwrap_or("").trim().to_string();
+                        // 拿路径
+                        let path = tokio::process::Command::new("sh").arg("-c").arg(format!("command -v {} 2>/dev/null", cmd))
+                            .output().await
+                            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+                        let installed = o.status.success() || !path.is_empty();
+                        json!({
+                            "installed": installed,
+                            "version": version,
+                            "path": path,
+                        })
+                    }
+                    Err(_) => json!({ "installed": false, "version": "", "path": "" }),
+                }
+            }
+            let php = detect_one("php", &["--version"]).await;
+            let node = detect_one("node", &["--version"]).await;
+            let python = detect_one("python3", &["--version"]).await;
+            let go = detect_one("go", &["version"]).await;
+            let java = detect_one("java", &["-version"]).await;
+            let nginx = detect_one("nginx", &["-v"]).await;
+            let redis = detect_one("redis-server", &["--version"]).await;
+            let mysql = detect_one("mysql", &["--version"]).await;
+            let docker = detect_one("docker", &["--version"]).await;
+            let envs = json!({
+                "php": php,
+                "node": node,
+                "python": python,
+                "go": go,
+                "java": java,
+                "nginx": nginx,
+                "redis": redis,
+                "mysql": mysql,
+                "docker": docker,
+            });
+            let mut summary_installed = 0usize;
+            if let Some(o) = envs.as_object() {
+                for (_, v) in o {
+                    if v["installed"].as_bool() == Some(true) {
+                        summary_installed += 1;
+                    }
+                }
+            }
+            json!({
+                "ok": true,
+                "environments": envs,
+                "total": 9,
+                "installed": summary_installed,
+            })
+        }
+        "env.install" => {
+            let env_id = params["env"].as_str().or(params["name"].as_str()).unwrap_or("").trim().to_string().to_lowercase();
+            if env_id.is_empty() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 env 参数（php/node/python/go/java/nginx/redis/mysql/docker）"}});
+            }
+            // 字母白名单：防注入
+            if !env_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "env 名仅允许字母数字和短横线"}});
+            }
+            // 探测包管理器（按优先级）：apt / dnf / yum / apk / pacman / zypper
+            let pm_check = tokio::process::Command::new("sh").arg("-c")
+                .arg("for p in apt dnf yum apk pacman zypper; do command -v $p >/dev/null 2>&1 && echo $p && break; done")
+                .output().await
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+            if pm_check.is_empty() {
+                return json!({"ok": false, "error": {"code": "NO_PACKAGE_MANAGER", "message": "未检测到支持的包管理器（apt/dnf/yum/apk/pacman/zypper）"}});
+            }
+            // 每个 env 在每个包管理器下的包名（一个 env 可能需要装多个包）
+            let pkgs: Vec<&str> = match (env_id.as_str(), pm_check.as_str()) {
+                ("php",    "apt")    => vec!["php", "php-cli", "php-fpm", "php-mysql", "php-mbstring", "php-xml", "php-curl"],
+                ("php",    "dnf") | ("php", "yum") => vec!["php", "php-cli", "php-fpm", "php-mysqlnd", "php-mbstring", "php-xml", "php-curl"],
+                ("php",    "apk")    => vec!["php", "php-cli", "php-fpm", "php-mysqli", "php-mbstring", "php-xml", "php-curl"],
+                ("php",    "pacman") => vec!["php", "php-fpm"],
+                ("php",    "zypper") => vec!["php8", "php8-cli", "php8-mysql", "php8-mbstring", "php8-xmlreader", "php8-curl"],
+                ("node",   "apt")    => vec!["nodejs", "npm"],
+                ("node",   "dnf") | ("node", "yum") => vec!["nodejs", "npm"],
+                ("node",   "apk")    => vec!["nodejs", "npm"],
+                ("node",   "pacman") => vec!["nodejs", "npm"],
+                ("node",   "zypper") => vec!["nodejs16", "npm16"],
+                ("python", "apt")    => vec!["python3", "python3-pip", "python3-venv"],
+                ("python", "dnf") | ("python", "yum") => vec!["python3", "python3-pip"],
+                ("python", "apk")    => vec!["python3", "py3-pip"],
+                ("python", "pacman") => vec!["python", "python-pip"],
+                ("python", "zypper") => vec!["python3", "python3-pip"],
+                ("go",     "apt")    => vec!["golang"],
+                ("go",     "dnf") | ("go", "yum") => vec!["golang"],
+                ("go",     "apk")    => vec!["go"],
+                ("go",     "pacman") => vec!["go"],
+                ("go",     "zypper") => vec!["go"],
+                ("java",   "apt")    => vec!["default-jdk"],
+                ("java",   "dnf") | ("java", "yum") => vec!["java-17-openjdk", "java-17-openjdk-devel"],
+                ("java",   "apk")    => vec!["openjdk17", "openjdk17-jdk"],
+                ("java",   "pacman") => vec!["jdk-openjdk"],
+                ("java",   "zypper") => vec!["java-17-openjdk", "java-17-openjdk-devel"],
+                ("nginx",  "apt")    => vec!["nginx"],
+                ("nginx",  "dnf") | ("nginx", "yum") => vec!["nginx"],
+                ("nginx",  "apk")    => vec!["nginx"],
+                ("nginx",  "pacman") => vec!["nginx"],
+                ("nginx",  "zypper") => vec!["nginx"],
+                ("redis",  "apt")    => vec!["redis-server"],
+                ("redis",  "dnf") | ("redis", "yum") => vec!["redis"],
+                ("redis",  "apk")    => vec!["redis"],
+                ("redis",  "pacman") => vec!["redis"],
+                ("redis",  "zypper") => vec!["redis"],
+                ("mysql",  "apt")    => vec!["mysql-server", "mysql-client"],
+                ("mysql",  "dnf") | ("mysql", "yum") => vec!["mysql-server"],
+                ("mysql",  "apk")    => vec!["mysql", "mysql-client"],
+                ("mysql",  "pacman") => vec!["mariadb"],
+                ("mysql",  "zypper") => vec!["mysql-community-server"],
+                ("docker", "apt")    => vec!["docker.io"],
+                ("docker", "dnf") | ("docker", "yum") => vec!["docker", "docker-compose-plugin"],
+                ("docker", "apk")    => vec!["docker", "docker-cli-compose"],
+                ("docker", "pacman") => vec!["docker", "docker-compose"],
+                ("docker", "zypper") => vec!["docker"],
+                _ => {
+                    return json!({"ok": false, "error": {"code": "UNSUPPORTED", "message": format!("不支持的环境 {} 或与包管理器 {} 的组合", env_id, pm_check)}});
+                }
+            };
+            // 组装安装命令
+            let install_cmd = match pm_check.as_str() {
+                "apt"    => vec!["apt-get", "install", "-y"],
+                "dnf"    => vec!["dnf", "install", "-y"],
+                "yum"    => vec!["yum", "install", "-y"],
+                "apk"    => vec!["apk", "add", "--no-cache"],
+                "pacman" => vec!["pacman", "-S", "--noconfirm"],
+                "zypper" => vec!["zypper", "--non-interactive", "install"],
+                _ => return json!({"ok": false, "error": {"code": "NO_PACKAGE_MANAGER", "message": "未检测到支持的包管理器"}}),
+            };
+            // apt / dnf / yum 通常需要先 update
+            if pm_check == "apt" {
+                let _ = tokio::process::Command::new("sh").arg("-c")
+                    .arg("sudo apt-get update 2>&1 | tail -5").output().await;
+            }
+            let mut cmd_str = format!("sudo {}", install_cmd.join(" "));
+            for p in &pkgs {
+                cmd_str.push(' ');
+                cmd_str.push_str(p);
+            }
+            // 执行
+            let output = tokio::process::Command::new("sh").arg("-c").arg(&cmd_str)
+                .output().await;
+            match output {
+                Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                    let exit_code = o.status.code().unwrap_or(-1);
+                    if o.status.success() {
+                        json!({
+                            "ok": true,
+                            "env": env_id,
+                            "action": "install",
+                            "packages": pkgs,
+                            "packageManager": pm_check,
+                            "exitCode": exit_code,
+                            "stdout": stdout.chars().take(2000).collect::<String>(),
+                            "stderr": stderr.chars().take(1000).collect::<String>(),
+                        })
+                    } else {
+                        json!({
+                            "ok": false,
+                            "env": env_id,
+                            "action": "install",
+                            "exitCode": exit_code,
+                            "stdout": stdout.chars().take(2000).collect::<String>(),
+                            "stderr": stderr.chars().take(1500).collect::<String>(),
+                            "error": {"code": "INSTALL_FAILED", "message": format!("安装失败（exit {}），详见 stderr", exit_code)},
+                        })
+                    }
+                }
+                Err(e) => json!({
+                    "ok": false,
+                    "env": env_id,
+                    "error": {"code": "EXEC_FAILED", "message": format!("执行失败: {}", e)},
+                }),
+            }
+        }
+        "env.uninstall" => {
+            let env_id = params["env"].as_str().or(params["name"].as_str()).unwrap_or("").trim().to_string().to_lowercase();
+            if env_id.is_empty() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 env 参数"}});
+            }
+            if !env_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "env 名仅允许字母数字和短横线"}});
+            }
+            // 探测包管理器
+            let pm_check = tokio::process::Command::new("sh").arg("-c")
+                .arg("for p in apt dnf yum apk pacman zypper; do command -v $p >/dev/null 2>&1 && echo $p && break; done")
+                .output().await
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+            if pm_check.is_empty() {
+                return json!({"ok": false, "error": {"code": "NO_PACKAGE_MANAGER", "message": "未检测到包管理器"}});
+            }
+            // 卸载命令组装（保持与 install 对称的包列表，但仅对 common 名）
+            let pkg_name = match env_id.as_str() {
+                "php"    => vec!["php", "php-cli", "php-fpm"],
+                "node"   => vec!["nodejs", "npm"],
+                "python" => vec!["python3", "python3-pip"],
+                "go"     => vec!["golang"],
+                "java"   => vec!["default-jdk", "java-17-openjdk"],
+                "nginx"  => vec!["nginx"],
+                "redis"  => vec!["redis-server", "redis"],
+                "mysql"  => vec!["mysql-server", "mysql-client", "mysql-community-server"],
+                "docker" => vec!["docker.io", "docker", "docker-ce"],
+                _ => return json!({"ok": false, "error": {"code": "UNSUPPORTED", "message": format!("不支持的环境 {}", env_id)}}),
+            };
+            let remove_args: Vec<&str> = match pm_check.as_str() {
+                "apt"    => vec!["apt-get", "purge", "-y"],
+                "dnf"    => vec!["dnf", "remove", "-y"],
+                "yum"    => vec!["yum", "remove", "-y"],
+                "apk"    => vec!["apk", "del"],
+                "pacman" => vec!["pacman", "-R", "--noconfirm"],
+                "zypper" => vec!["zypper", "--non-interactive", "remove"],
+                _ => return json!({"ok": false, "error": {"code": "NO_PACKAGE_MANAGER", "message": "未检测到支持的包管理器"}}),
+            };
+            let mut cmd_str = format!("sudo {}", remove_args.join(" "));
+            for p in &pkg_name {
+                cmd_str.push(' ');
+                cmd_str.push_str(p);
+            }
+            let output = tokio::process::Command::new("sh").arg("-c").arg(&cmd_str)
+                .output().await;
+            match output {
+                Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                    let exit_code = o.status.code().unwrap_or(-1);
+                    if o.status.success() {
+                        json!({
+                            "ok": true,
+                            "env": env_id,
+                            "action": "uninstall",
+                            "exitCode": exit_code,
+                            "stdout": stdout.chars().take(2000).collect::<String>(),
+                            "stderr": stderr.chars().take(1000).collect::<String>(),
+                        })
+                    } else {
+                        json!({
+                            "ok": false,
+                            "env": env_id,
+                            "action": "uninstall",
+                            "exitCode": exit_code,
+                            "stdout": stdout.chars().take(2000).collect::<String>(),
+                            "stderr": stderr.chars().take(1500).collect::<String>(),
+                            "error": {"code": "UNINSTALL_FAILED", "message": format!("卸载失败（exit {}），详见 stderr", exit_code)},
+                        })
+                    }
+                }
+                Err(e) => json!({
+                    "ok": false,
+                    "env": env_id,
+                    "error": {"code": "EXEC_FAILED", "message": format!("执行失败: {}", e)},
+                }),
+            }
+        }
+
+        // ====================================================================
+        // 二步验证（auth.2fa.*）：TOTP + 邮件验证码
+        // ====================================================================
+        "auth.2fa.setup" => {
+            // 生成 TOTP 密钥并返回 otpauth URI（前端据此生成二维码）
+            // 要求已认证用户
+            let cu = state.current_user.lock().await;
+            let uid = cu.as_ref().map(|u| u.id.clone()).unwrap_or_default();
+            let uname = cu.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+            drop(cu);
+            if uid.is_empty() { return json!({"ok": false, "error": {"code": "UNAUTHORIZED", "message": "未认证"}}); }
+            // 可选传入 userId（admin 为他人配置），默认当前用户
+            let target_uid = params["userId"].as_str().map(String::from).unwrap_or(uid);
+            let mut users = state.storage.load_users();
+            let u = match users.iter_mut().find(|u| u.id == target_uid) {
+                Some(u) => u,
+                None => return json!({"ok": false, "error": {"code": "NOT_FOUND", "message": "用户不存在"}}),
+            };
+            // 生成新密钥（即使已存在也覆盖）
+            let secret = gen_totp_secret();
+            u.totp_secret = Some(secret.clone());
+            // 注意：setup 不立即启用，需要 verify 成功后才设 twofa_enabled=true
+            let account = params["account"].as_str()
+                .map(String::from)
+                .unwrap_or_else(|| u.email.clone().unwrap_or_else(|| u.username.clone()));
+            let issuer = params["issuer"].as_str().unwrap_or("CradleRing");
+            let uri = build_totp_uri(&secret, &account, issuer);
+            state.storage.save_users(&users);
+            json!({
+                "ok": true,
+                "userId": target_uid,
+                "username": uname,
+                "secret": secret,
+                "otpauthUri": uri,
+                "algorithm": "SHA1",
+                "digits": 6,
+                "period": 30,
+                "note": "请用 Google Authenticator / Authy 等扫码添加；添加后用 auth.2fa.verify 输入 6 位码完成开启",
+            })
+        }
+        "auth.2fa.verify" => {
+            // 用户输入 6 位 TOTP 码：验证成功则标记 twofa_enabled=true
+            let cu = state.current_user.lock().await;
+            let uid = cu.as_ref().map(|u| u.id.clone()).unwrap_or_default();
+            drop(cu);
+            if uid.is_empty() { return json!({"ok": false, "error": {"code": "UNAUTHORIZED", "message": "未认证"}}); }
+            let code_str = params["code"].as_str().unwrap_or("").trim().to_string();
+            let code: u32 = match code_str.parse() {
+                Ok(n) if code_str.len() == 6 => n,
+                _ => return json!({"ok": false, "error": {"code": "INVALID_CODE", "message": "验证码必须为 6 位数字"}}),
+            };
+            let target_uid = params["userId"].as_str().map(String::from).unwrap_or(uid);
+            let mut users = state.storage.load_users();
+            let u = match users.iter_mut().find(|u| u.id == target_uid) {
+                Some(u) => u,
+                None => return json!({"ok": false, "error": {"code": "NOT_FOUND", "message": "用户不存在"}}),
+            };
+            let secret_b32 = match &u.totp_secret {
+                Some(s) => s.clone(),
+                None => return json!({"ok": false, "error": {"code": "NOT_SETUP", "message": "尚未生成 TOTP 密钥，请先调用 auth.2fa.setup"}}),
+            };
+            let secret_bytes = match base32_decode(&secret_b32) {
+                Some(b) => b,
+                None => return json!({"ok": false, "error": {"code": "SECRET_CORRUPT", "message": "密钥解码失败"}}),
+            };
+            if totp_verify(&secret_bytes, code) {
+                u.twofa_enabled = true;
+                u.twofa_method = Some("totp".to_string());
+                state.storage.save_users(&users);
+                json!({"ok": true, "verified": true, "message": "二步验证已开启"})
+            } else {
+                json!({"ok": false, "verified": false, "error": {"code": "WRONG_CODE", "message": "验证码错误或已过期"}})
+            }
+        }
+        "auth.2fa.disable" => {
+            let cu = state.current_user.lock().await;
+            let uid = cu.as_ref().map(|u| u.id.clone()).unwrap_or_default();
+            if uid.is_empty() { return json!({"ok": false, "error": {"code": "UNAUTHORIZED", "message": "未认证"}}); }
+            let target_uid = params["userId"].as_str().map(String::from).unwrap_or(uid);
+            let mut users = state.storage.load_users();
+            let u = match users.iter_mut().find(|u| u.id == target_uid) {
+                Some(u) => u,
+                None => return json!({"ok": false, "error": {"code": "NOT_FOUND", "message": "用户不存在"}}),
+            };
+            u.twofa_enabled = false;
+            u.totp_secret = None;
+            u.twofa_method = None;
+            state.storage.save_users(&users);
+            json!({"ok": true, "disabled": true, "userId": target_uid})
+        }
+        "auth.2fa.status" => {
+            let cu = state.current_user.lock().await;
+            let uid = cu.as_ref().map(|u| u.id.clone()).unwrap_or_default();
+            if uid.is_empty() { return json!({"ok": false, "error": {"code": "UNAUTHORIZED", "message": "未认证"}}); }
+            let target_uid = params["userId"].as_str().map(String::from).unwrap_or(uid);
+            let users = state.storage.load_users();
+            let u = match users.iter().find(|u| u.id == target_uid) {
+                Some(u) => u,
+                None => return json!({"ok": false, "error": {"code": "NOT_FOUND", "message": "用户不存在"}}),
+            };
+            json!({
+                "ok": true,
+                "userId": u.id,
+                "enabled": u.twofa_enabled,
+                "method": u.twofa_method,
+                "hasSecret": u.totp_secret.is_some(),
+            })
+        }
+        "auth.2fa.send_email_code" => {
+            // 给指定邮箱发送 6 位验证码，10 分钟有效
+            let email = params["email"].as_str().unwrap_or("").trim().to_string();
+            if email.is_empty() || !email.contains('@') {
+                return json!({"ok": false, "error": {"code": "INVALID_EMAIL", "message": "邮箱不合法"}});
+            }
+            let email_cfg = get_email_config(&state);
+            let smtp = email_cfg.get("smtp").cloned().unwrap_or(json!({}));
+            let host = smtp["host"].as_str().unwrap_or("").to_string();
+            let port = smtp["port"].as_u64().unwrap_or(587) as u16;
+            let username = smtp["username"].as_str().unwrap_or("").to_string();
+            let password = smtp["password"].as_str().unwrap_or("").to_string();
+            let from = smtp["from"].as_str().unwrap_or(username.as_str()).to_string();
+            let use_tls = smtp["useTls"].as_bool().unwrap_or(true);
+            if host.is_empty() {
+                return json!({"ok": false, "error": {"code": "SMTP_NOT_CONFIGURED", "message": "未配置 SMTP，请先调用 email.config.set"}});
+            }
+            let code = gen_email_code();
+            let expires_at = current_ms() + 10 * 60 * 1000;
+            {
+                let mut codes = state.twofa_codes.lock().await;
+                codes.insert(email.clone(), (code.clone(), expires_at));
+            }
+            let body = format!(
+                "您的 CradleRing 验证码是：{}\n\n该验证码 10 分钟内有效。\n如非本人操作，请忽略此邮件。",
+                code
+            );
+            match smtp_send(
+                host, port, username, password, from,
+                email.clone(),
+                "CradleRing 二步验证码".to_string(),
+                body,
+                use_tls,
+            ).await {
+                Ok(_) => json!({"ok": true, "sent": true, "email": email, "expiresIn": 600}),
+                Err(e) => json!({"ok": false, "error": {"code": "SMTP_SEND_FAILED", "message": format!("发件失败: {}", e)}}),
+            }
+        }
+        "auth.2fa.verify_email_code" => {
+            let email = params["email"].as_str().unwrap_or("").trim().to_string();
+            let code = params["code"].as_str().unwrap_or("").trim().to_string();
+            if email.is_empty() || code.is_empty() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 email 或 code"}});
+            }
+            let mut codes = state.twofa_codes.lock().await;
+            match codes.get(&email) {
+                Some((stored, expires_at)) => {
+                    if current_ms() > *expires_at {
+                        codes.remove(&email);
+                        return json!({"ok": false, "error": {"code": "EXPIRED", "message": "验证码已过期"}});
+                    }
+                    if !constant_time_eq(stored.as_bytes(), code.as_bytes()) {
+                        return json!({"ok": false, "error": {"code": "WRONG_CODE", "message": "验证码错误"}});
+                    }
+                    // 验证通过：删除该码（一次性），可选标记用户开启 email 2FA
+                    codes.remove(&email);
+                    drop(codes);
+                    // 若指定了 userId，标记用户启用 email 2FA
+                    if let Some(target_uid) = params["userId"].as_str() {
+                        let mut users = state.storage.load_users();
+                        if let Some(u) = users.iter_mut().find(|u| u.id == target_uid) {
+                            u.twofa_enabled = true;
+                            u.twofa_method = Some("email".to_string());
+                            state.storage.save_users(&users);
+                        }
+                    }
+                    json!({"ok": true, "verified": true})
+                }
+                None => json!({"ok": false, "error": {"code": "NOT_FOUND", "message": "未找到该邮箱的验证码（可能已使用或未发送）"}}),
+            }
+        }
+
+        // ====================================================================
+        // 邮件配置 + 发信（email.*）
+        // ====================================================================
+        "email.config.get" => {
+            json!({"ok": true, "config": get_email_config(&state)})
+        }
+        "email.config.set" => {
+            let cfg = params["config"].clone();
+            if !cfg.is_object() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 config 对象"}});
+            }
+            match save_email_config(&state, &cfg) {
+                Ok(_) => json!({"ok": true, "saved": true}),
+                Err(e) => json!({"ok": false, "error": {"code": "WRITE_FAILED", "message": e}}),
+            }
+        }
+        "email.test" => {
+            // 用现有或 params.smtp 配置发一封测试邮件
+            let smtp = if params["smtp"].is_object() {
+                params["smtp"].clone()
+            } else {
+                get_email_config(&state).get("smtp").cloned().unwrap_or(json!({}))
+            };
+            let host = smtp["host"].as_str().unwrap_or("").to_string();
+            let port = smtp["port"].as_u64().unwrap_or(587) as u16;
+            let username = smtp["username"].as_str().unwrap_or("").to_string();
+            let password = smtp["password"].as_str().unwrap_or("").to_string();
+            let from = smtp["from"].as_str().unwrap_or(username.as_str()).to_string();
+            let use_tls = smtp["useTls"].as_bool().unwrap_or(true);
+            let to = params["to"].as_str().unwrap_or(username.as_str()).to_string();
+            if host.is_empty() || to.is_empty() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 host 或 to"}});
+            }
+            match smtp_send(
+                host, port, username, password, from,
+                to,
+                "CradleRing SMTP 测试".to_string(),
+                "这是一封来自 CradleRing 网关的测试邮件，收到即说明 SMTP 配置正确。".to_string(),
+                use_tls,
+            ).await {
+                Ok(_) => json!({"ok": true, "tested": true, "sent": true}),
+                Err(e) => json!({"ok": false, "tested": true, "sent": false, "error": {"code": "SMTP_SEND_FAILED", "message": e}}),
+            }
+        }
+        "email.send" => {
+            let email_cfg = get_email_config(&state);
+            let smtp = email_cfg.get("smtp").cloned().unwrap_or(json!({}));
+            let host = smtp["host"].as_str().unwrap_or("").to_string();
+            let port = smtp["port"].as_u64().unwrap_or(587) as u16;
+            let username = smtp["username"].as_str().unwrap_or("").to_string();
+            let password = smtp["password"].as_str().unwrap_or("").to_string();
+            let from = smtp["from"].as_str().unwrap_or(username.as_str()).to_string();
+            let use_tls = smtp["useTls"].as_bool().unwrap_or(true);
+            let to = params["to"].as_str().unwrap_or("").to_string();
+            let subject = params["subject"].as_str().unwrap_or("(no subject)").to_string();
+            let body = params["body"].as_str().unwrap_or("").to_string();
+            if host.is_empty() {
+                return json!({"ok": false, "error": {"code": "SMTP_NOT_CONFIGURED", "message": "未配置 SMTP，请先调用 email.config.set"}});
+            }
+            if to.is_empty() || !to.contains('@') {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "收件人 to 邮箱不合法"}});
+            }
+            match smtp_send(
+                host, port, username, password, from, to, subject, body, use_tls,
+            ).await {
+                Ok(info) => json!({"ok": true, "sent": true, "info": info}),
+                Err(e) => json!({"ok": false, "error": {"code": "SMTP_SEND_FAILED", "message": e}}),
             }
         }
 
@@ -14635,6 +15308,189 @@ fn verify_jwt(token: &str, state: &AppState) -> Option<(String, String, String)>
     ))
 }
 
+/// 从 RPC params 取 token 字段并验证；返回 (user_id, username, role) 或 None
+/// token 字段支持 params.token / params.authorization / "Bearer xxx" 前缀
+fn auth_from_params(state: &AppState, params: &serde_json::Value) -> Option<(String, String, String)> {
+    let token = params["token"].as_str()
+        .or_else(|| params["authorization"].as_str())
+        .unwrap_or("");
+    let token = token.trim_start_matches("Bearer ").trim();
+    if token.is_empty() {
+        return None;
+    }
+    verify_jwt(token, state)
+}
+
+/// 获取 SMTP 配置（读 raw_json.email，没有则返回默认空配置）
+fn get_email_config(state: &AppState) -> serde_json::Value {
+    state.config.raw_json
+        .get("email")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({
+            "enabled": false,
+            "smtp": { "host": "", "port": 587, "username": "", "password": "", "from": "", "useTls": true },
+            "defaults": { "fromName": "CradleRing" }
+        }))
+}
+
+/// 写 SMTP 配置到 cradle-ring.json 的 email 节
+fn save_email_config(state: &AppState, new_email: &serde_json::Value) -> Result<(), String> {
+    let cfg_path = format!("{}/.cradle-ring/cradle-ring.json", state.storage.home);
+    let mut current: serde_json::Value = std::fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(json!({}));
+    current["email"] = new_email.clone();
+    if let Err(e) = std::fs::write(&cfg_path, serde_json::to_string_pretty(&current).unwrap_or_default()) {
+        return Err(format!("写配置失败: {}", e));
+    }
+    Ok(())
+}
+
+/// 同步阻塞地用原生 TCP 发送一封 SMTP 邮件
+/// 支持 EHLO / AUTH LOGIN / MAIL FROM / RCPT TO / DATA，可选 STARTTLS 升级
+/// 注：出于"不引入新 crate"约束，这里不接入 TLS 库，STARTTLS 仅在显式 useTls=false 或本地 SMTP
+/// 中继（25 端口明文）时工作；对于公网 TLS（465/587）建议配置外部中继并声明 useTls=false
+#[allow(clippy::too_many_arguments)]
+fn smtp_send_blocking(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    from: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    use_tls: bool,
+) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let addr = format!("{}:{}", host, port);
+    let stream = TcpStream::connect_timeout(
+        &addr.parse::<std::net::SocketAddr>().or_else(|_| {
+            // 若 addr 不是字面 SocketAddr（域名），先用默认 resolver
+            std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+                .ok()
+                .and_then(|mut it| it.next())
+                .ok_or("无法解析地址")
+        }).map_err(|e| format!("地址解析失败: {}", e))?,
+        Duration::from_secs(15),
+    ).map_err(|e| format!("连接 {} 失败: {}", addr, e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(15))).ok();
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| format!("clone 失败: {}", e))?);
+    let mut writer = stream;
+
+    fn read_line<R: BufRead>(reader: &mut R) -> Result<String, String> {
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(|e| format!("读失败: {}", e))?;
+        Ok(line)
+    }
+    // 读多行 SMTP 响应（形如 "250-...", "250 ..."）
+    fn read_response<R: BufRead>(reader: &mut R) -> Result<(u16, String), String> {
+        let mut text = String::new();
+        loop {
+            let line = read_line(reader)?;
+            if line.len() < 4 {
+                return Err(format!("SMTP 响应格式错误: {}", line.trim()));
+            }
+            let code: u16 = line[..3].parse().map_err(|_| format!("SMTP 响应码错误: {}", line.trim()))?;
+            text.push_str(line.trim_end_matches(['\r', '\n']));
+            text.push('\n');
+            // 第 4 个字符若为 ' ' 表示响应结束；'-' 表示还有后续行
+            let sep = line.as_bytes()[3] as char;
+            if sep == ' ' {
+                return Ok((code, text));
+            }
+        }
+    }
+    // 帮助函数：发送一行 + 读取响应
+    fn send_cmd<W: Write, R: BufRead>(writer: &mut W, reader: &mut R, cmd: &str) -> Result<(u16, String), String> {
+        writer.write_all(cmd.as_bytes()).map_err(|e| format!("写失败: {}", e))?;
+        writer.write_all(b"\r\n").map_err(|e| format!("写失败: {}", e))?;
+        writer.flush().map_err(|e| format!("flush 失败: {}", e))?;
+        read_response(reader)
+    }
+
+    // 1. 服务器问候
+    let (greet_code, _) = read_response(&mut reader).map_err(|e| format!("读取服务器问候失败: {}", e))?;
+    if greet_code != 220 {
+        return Err(format!("SMTP 服务器问候异常: {}", greet_code));
+    }
+    // 2. EHLO
+    let ehlo_host = "cradlering.local";
+    let (ehlo_code, ehlo_text) = send_cmd(&mut writer, &mut reader, &format!("EHLO {}", ehlo_host))?;
+    if ehlo_code != 250 {
+        return Err(format!("EHLO 失败: {} {}", ehlo_code, ehlo_text));
+    }
+    // 3. STARTTLS：若服务器支持且启用 use_tls，则尝试升级
+    let server_supports_starttls = ehlo_text.to_lowercase().contains("starttls");
+    if use_tls && server_supports_starttls {
+        // 真正的 TLS 握手需要 rustls/native-tls，本实现不引入新 crate，因此
+        // 对 STARTTLS 仅作为提示返回，公网 TLS 应通过外部中继
+        return Err("服务器要求 STARTTLS，本网关未引入 TLS 库；请配置本地 SMTP 中继（明文 25 端口）或外部 sendmail".into());
+    }
+    // 4. AUTH LOGIN（若配置了凭据）
+    if !username.is_empty() && !password.is_empty() {
+        let auth_support = ehlo_text.to_lowercase().contains("auth login");
+        if auth_support {
+            send_cmd(&mut writer, &mut reader, "AUTH LOGIN")?;
+            // 用户名（base64）
+            send_cmd(&mut writer, &mut reader, &base64::engine::general_purpose::STANDARD.encode(username.as_bytes()))?;
+            // 密码（base64）
+            let (auth_code, auth_text) = send_cmd(&mut writer, &mut reader, &base64::engine::general_purpose::STANDARD.encode(password.as_bytes()))?;
+            if auth_code != 235 {
+                return Err(format!("SMTP 认证失败: {} {}", auth_code, auth_text));
+            }
+        }
+    }
+    // 5. MAIL FROM
+    let (mf_code, mf_text) = send_cmd(&mut writer, &mut reader, &format!("MAIL FROM:<{}>", from))?;
+    if mf_code != 250 {
+        return Err(format!("MAIL FROM 失败: {} {}", mf_code, mf_text));
+    }
+    // 6. RCPT TO
+    let (rc_code, rc_text) = send_cmd(&mut writer, &mut reader, &format!("RCPT TO:<{}>", to))?;
+    if rc_code != 250 && rc_code != 251 {
+        return Err(format!("RCPT TO 失败: {} {}", rc_code, rc_text));
+    }
+    // 7. DATA
+    let (data_code, _) = send_cmd(&mut writer, &mut reader, "DATA")?;
+    if data_code != 354 {
+        return Err(format!("DATA 失败: {}", data_code));
+    }
+    let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S +0000").to_string();
+    let msg = format!(
+        "From: {}\r\nTo: {}\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nDate: {}\r\n\r\n{}\r\n.\r\n",
+        from, to, subject, date, body
+    );
+    writer.write_all(msg.as_bytes()).map_err(|e| format!("DATA 写失败: {}", e))?;
+    writer.flush().map_err(|e| format!("flush 失败: {}", e))?;
+    let (end_code, end_text) = read_response(&mut reader)?;
+    if end_code != 250 {
+        return Err(format!("邮件发送失败: {} {}", end_code, end_text));
+    }
+    // 8. QUIT
+    let _ = send_cmd(&mut writer, &mut reader, "QUIT");
+    Ok(format!("已发送至 {}", to))
+}
+
+/// 异步包装：在 tokio blocking 任务里发邮件
+#[allow(clippy::too_many_arguments)]
+async fn smtp_send(
+    host: String, port: u16, username: String, password: String,
+    from: String, to: String, subject: String, body: String, use_tls: bool,
+) -> Result<String, String> {
+    let h = host.clone();
+    tokio::task::spawn_blocking(move || {
+        smtp_send_blocking(&h, port, &username, &password, &from, &to, &subject, &body, use_tls)
+    })
+    .await
+    .map_err(|e| format!("邮件任务异常: {}", e))?
+}
+
 /// 初始化默认 admin 用户（如 users.json 不存在或为空）
 async fn ensure_default_admin(state: &AppState) {
     let mut users = state.storage.load_users();
@@ -14671,6 +15527,9 @@ async fn ensure_default_admin(state: &AppState) {
         created_at: now,
         last_login: None,
         approval_enabled: true,
+        totp_secret: None,
+        twofa_enabled: false,
+        twofa_method: None,
     });
     state.storage.save_users(&users);
     // 广播事件（不暴露密码）
@@ -15007,6 +15866,8 @@ fn user_to_json(u: &User) -> serde_json::Value {
         "approvalEnabled": u.approval_enabled,
         "createdAt": u.created_at,
         "lastLogin": u.last_login,
+        "twoFactorEnabled": u.twofa_enabled,
+        "twoFactorMethod": u.twofa_method,
     })
 }
 
@@ -17164,6 +18025,9 @@ async fn handle_websocket_connection(
                                 created_at: 0,
                                 last_login: None,
                                 approval_enabled: true,
+                                totp_secret: None,
+                                twofa_enabled: false,
+                                twofa_method: None,
                             });
                         }
                     }
