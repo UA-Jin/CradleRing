@@ -1,10 +1,11 @@
 # CradleRing
 
-> 企业级 AI Agent 协作平台 — 多 Agent 编排、多级审批、40+ IM 渠道、WAF 安全防护、可视化工作流
+> 企业级 AI Agent 协作平台 — 多 Agent 编排、多级审批、40+ IM 渠道、IDS/IPS + WAF 安全防护、可视化工作流、环境一键部署、节点集群管理
 
 [![License](https://img.shields.io/badge/license-商业源码许可-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.0.1-green)](https://github.com/UA-Jin/CradleRing/releases)
+[![Version](https://img.shields.io/badge/version-0.0.2-green)](https://github.com/UA-Jin/CradleRing/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange)](https://www.rust-lang.org)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](https://github.com/UA-Jin/CradleRing)
 
 ## 🚀 快速部署
 
@@ -22,20 +23,19 @@ curl -fsSL https://raw.githubusercontent.com/UA-Jin/CradleRing/main/install.sh |
 irm https://raw.githubusercontent.com/UA-Jin/CradleRing/main/install.ps1 | iex
 ```
 
-> **说明**：一键安装脚本会自动检测并安装所有依赖：
-> - **Rust 工具链**：未安装时自动通过 rustup 安装（Windows 自动下载 rustup-init.exe）
-> - **C 编译器**：Linux/macOS 自动安装（apt/yum/dnf/apk/pacman）；Windows 需手动安装 Visual Studio Build Tools 或 MinGW
-> - **源码下载**：本地无源码时自动从 GitHub 下载（支持 git clone 或 curl tarball）
-> - **前端构建**：自动安装 pnpm 依赖并构建（--ignore-scripts 跳过构建脚本检查）
-> - **自启动**：Linux（systemd）、macOS（launchd）、Windows（Task Scheduler）自动注册开机自启
->
-> 全程无需手动安装任何依赖，适合全新服务器一键部署。
+一键安装脚本自动完成：
+- **Rust 工具链**：自动通过 rustup 安装（Windows 自动下载 rustup-init.exe）
+- **C 编译器**：Linux/macOS 自动安装（apt/yum/dnf/apk/pacman）；Windows 自动下载 WinLibs MinGW
+- **源码下载**：本地无源码时自动从 GitHub 下载（支持 git clone 或 curl tarball）
+- **前端构建**：自动安装 Node.js/pnpm 并构建（npm.cmd 绕过 PowerShell 执行策略）
+- **交互式配置**：模型 Provider（20 个国产+国际）/ Embedding（本地 bge-small 或硅基流动 Qwen3-VL）/ 绑定地址 / IM 渠道
+- **自启动**：Linux（systemd）、macOS（launchd）、Windows（Task Scheduler）自动注册
+
+全程无需手动安装任何依赖，适合全新服务器一键部署。
 
 ### 开放外网访问（绑 0.0.0.0）
 
-默认网关只绑定 `127.0.0.1`（本机访问）。如需让局域网/公网访问，修改配置文件：
-
-**Linux / macOS：**
+默认网关只绑定 `127.0.0.1`（本机访问）。如需局域网/公网访问：
 
 ```bash
 # 编辑配置
@@ -45,31 +45,15 @@ nano ~/.cradle-ring/cradle-ring.json
 {
   "gateway": {
     "bind": "0.0.0.0",
-    "port": 18800,
-    "auth": { "token": "your-token" }
+    "port": 18800
   }
 }
-
-# 重启网关生效
-cradle-ring gateway start
-```
-
-**Windows：**
-
-```powershell
-# 编辑配置
-notepad $env:USERPROFILE\.cradle-ring\cradle-ring.json
-
-# 同上，把 "gateway.bind" 改为 "0.0.0.0"
 
 # 重启网关
 cradle-ring gateway start
 ```
 
-> ⚠️ **安全提示**：绑 `0.0.0.0` 后所有网络接口可访问，请确保：
-> 1. 已设置强密码（安装时生成的随机密码）
-> 2. 防火墙已放行端口（Linux: `ufw allow 18800`；Windows: 防火墙入站规则）
-> 3. 建议仅在内网使用，公网部署请加反向代理（Nginx/Caddy）+ HTTPS
+⚠️ **安全提示**：开放外网后请确保登录密码强度足够，并配置防火墙只放行可信 IP。建议同时开启登录二步验证。
 
 ### 手动安装
 
@@ -79,11 +63,10 @@ git clone https://github.com/UA-Jin/CradleRing.git
 cd CradleRing
 
 # 2. 编译（需要 Rust 1.70+）
-cargo build --release --bin cradle-ring
+cargo build --release
 
 # 3. 安装
-./install.sh          # Linux / macOS
-.\install.ps1         # Windows（PowerShell 管理员）
+cp target/release/cradle-ring ~/.local/bin/
 
 # 4. 启动
 cradle-ring gateway start
@@ -92,260 +75,255 @@ cradle-ring gateway start
 # http://127.0.0.1:18800
 ```
 
-**默认登录**：安装完成后，系统会自动生成随机用户名和密码（如 `admin_1822677b` / `bmf0WhXIc1FrGRzm`），仅显示一次，请妥善保管。
-
-### 一键更新
-
-重新运行安装脚本即可更新到最新版本（会保留你的配置和数据）：
+### 一键更新 / 卸载
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/UA-Jin/CradleRing/main/install.sh | bash
-```
+# 更新到最新版
+cradle-ring self-update
 
-如果 CDN 缓存导致脚本没更新，用 git clone 方式强制拉最新：
-
-```bash
-git clone https://github.com/UA-Jin/CradleRing.git /tmp/cr && cd /tmp/cr && bash install.sh
-```
-
-更新后需要重启网关生效：
-
-```bash
-cradle-ring gateway start   # 或重启 systemd 服务
-```
-
-> **说明**：更新只覆盖二进制和 UI 文件，`~/.cradle-ring/` 下的配置、会话、审批记录、用户数据全部保留。
-
-### 一键卸载
-
-```bash
 # 停止服务
-cradle-ring gateway stop 2>/dev/null
-systemctl --user stop cradle-ring-gateway 2>/dev/null
-launchctl unload ~/Library/LaunchAgents/dev.cradle-ring.gateway.plist 2>/dev/null
+cradle-ring gateway stop
 
-# 删除二进制 + UI + 数据（配置和会话全删）
-rm -rf ~/.local/bin/cradle-ring ~/.local/bin/ui-dist ~/.cradle-ring
-
-# 删除 systemd / launchd 服务（可选）
-rm -f ~/.config/systemd/user/cradle-ring-gateway.service
-rm -f ~/Library/LaunchAgents/dev.cradle-ring.gateway.plist
+# 卸载（删除二进制 + UI + 数据）
+cradle-ring uninstall
 ```
-
-如果只想重装但保留 Rust 工具链（其他项目在用），只删 CradleRing 相关：
-
-```bash
-rm -rf ~/.local/bin/cradle-ring ~/.local/bin/ui-dist ~/.cradle-ring
-```
-
-彻底清理（连 Rust 一起删，慎用）：
-
-```bash
-rm -rf ~/.local/bin/cradle-ring ~/.local/bin/ui-dist ~/.cradle-ring ~/.cargo ~/.rustup
-```
-
----
 
 ## ✨ 功能特点
 
 ### 🤖 多 Agent 编排引擎
 
-| 能力 | 说明 |
-|------|------|
-| **有状态图引擎** | 对标 LangGraph：9 种节点类型（LLM/Tool/Agent/Condition/Parallel/Interrupt/HumanReview/End），条件路由 + 检查点 + 回滚 + interrupt 断点 |
-| **角色化 Agent** | 对标 CrewAI：role + goal + backstory + 工具白名单 + 独立 system prompt，7 个预置运维专家（根因诊断/SRE/网络/磁盘/计算/服务/SOP 二审） |
-| **Sequential 流水线** | 多 Agent 按顺序接力执行，前一阶段输出自动传入下一阶段 |
-| **并行工具调用** | 同一轮 LLM 返回多个 tool_call 时并行执行（FuturesUnordered），Map-Reduce 扇出支持批量子任务并行 |
-| **执行追踪** | 完整 span 树：workflow → node → tool_call/llm_call，含耗时/token/cost/IO |
+- **角色化 Agent**：7 个预置运维专家角色（DevOps/SRE/DBA/Security/Network/Cloud/Compliance），自定义角色（system prompt + 工具白名单 + 模型覆盖）
+- **LangGraph 工作流**：状态图 + 检查点 + 回滚，支持分支/循环/并行/人工审批节点
+- **CrewAI 流水线**：多角色 Agent 顺序接力，支持上下文传递
+- **子 Agent 并行**：spawn_subagent 并行执行独立任务，自动聚合结果
+- **无损上下文压缩**：超长会话自动摘要，保留关键信息不丢失
 
-### 🔒 安全与审批
+### 🔒 安全防护（IDS/IPS + WAF）
 
-| 能力 | 说明 |
-|------|------|
-| **WAF 安全防护** | 对标 ModSecurity：10 条 OWASP CRS 核心规则（SQL 注入/XSS/命令注入/路径遍历/Log4j），WAF 类型识别（Cloudflare/AWS/阿里云盾等 10 种） |
-| **多级审批工作流** | 对标钉钉审批：主管→领导→执行链式审批，支持 IM 渠道审批（钉钉/飞书/Telegram 回复"同意/拒绝"即可处理） |
-| **命令策略沙箱** | 6 级命令分类（read_fs/read_system/mixed/net_diag/write/destructive），60+ 命令白名单，DeniedArgs 精确拦截（find -delete/-exec 等） |
-| **AI SOP 二审** | 高危操作自动检查：有 SOP 覆盖？无并行操作？回滚路径已知？三条全过才 approve，否则 reject |
-| **变更事件审计** | 所有 mutating 操作记录 audit log，支持 RCA 根因分析"谁改了什么" |
+- **WAF（Web 应用防火墙）**：50+ OWASP CRS 规则（SQL 注入/XSS/路径遍历/命令注入/扫描器/敏感文件/Log4j JNDI），自定义规则 CRUD + 启用禁用 + 事件日志
+- **IDS/IPS（入侵检测/防御）**：SSH 暴力破解、端口扫描、恶意软件、C2 外联检测，自动封禁 + 手动封禁/解封 + 规则管理
+- **IP 黑白名单**：CIDR 格式，白名单优先放行
+- **速率限制**：按 IP 限流，防暴力破解和 DDoS
+- **命令审批**：多级审批工作流，危险命令自动触发审批，支持审批流模板（按风险等级路由）
+- **登录安全**：失败 5 次锁定 5 分钟，可选二步验证（TOTP 谷歌身份验证器 / 邮件验证码）
+- **Webhook 密钥**：渠道回调 URL 带密钥，防伪造消息注入
 
-### 🌐 全渠道接入
+### 🌐 全渠道接入（40+ IM）
 
-- **40+ IM 渠道**：飞书、钉钉、企业微信、Telegram、Discord、Slack、WhatsApp、Signal、QQ、Matrix、Teams、Webhook 等
-- **真实连接**：Webhook 接收 + API 发送 + 后台轮询（Telegram/Discord/Matrix 长轮询）
-- **消息去重**：防重复处理，渠道状态实时监控
+- **40+ 渠道真实连接**：飞书/钉钉/企微/Telegram/Discord/Slack/WhatsApp/Signal/QQ/Matrix/Teams/IRC/Nostr/Twitch/LINE/Mattermost/Nextcloud/Synology/Tlon/Zalo/Google Chat/Rocket.Chat/Zulip/Gitter/XMPP/Mastodon/Twitter/SMS/Viber/KakaoTalk/Threads/Bluesky/Misskey/Wire/Keybase/Threema/Session/Blogger
+- **渠道测试真实化**：按渠道类型调平台 API 验证凭据（飞书 tenant_token / Telegram getMe / Discord @me / 钉钉 gettoken / Slack auth.test / WhatsApp），不再假通过
+- **Webhook 密钥**：可选启用，回调 URL 带密钥防伪造
+- **消息格式**：文本/图片/文件/卡片/按钮，支持 Markdown 渲染
+
+### 📊 可视化运维（节点集群）
+
+- **监控大屏**：世界地图设备分布、延迟趋势、风险排行、主机监控（CPU/内存/磁盘/负载/网络 IO 实时仪表）
+- **节点选择**：本机 + 远程 SSH 节点切换监控，离线自动回退本机
+- **节点管理**：SSH 节点添加/测试/删除，一键安装代码生成（自动注册 + 心跳上报）
+- **环境一键部署**：9 种环境（PHP/NodeJS/Python/Go/Java/Nginx/Redis/MySQL/Docker）自动检测/安装/卸载，支持本地/远程节点
+- **文件管理**：远程节点文件浏览/查看/下载/删除/新建目录
+- **进程管理**：实时进程列表（CPU/内存排序），支持各节点
+- **服务管理**：systemd 服务启停/日志，支持各节点
+- **防火墙**：iptables/ufw 规则管理 + 规则导入（自动备份）+ 状态详情
+
+### 🧠 记忆系统 V3（Cache-First + 向量检索 + 时序知识图谱 + 级联路由）
+
+- **Cache-First**：相同问题第二次直接命中缓存（0 成本），L1 精确 + L2 语义（相似度 >0.92）+ L4 向量检索
+- **向量检索**：纯 Rust 余弦相似度 + 元数据过滤，Embedding 可选本地（bge-small-zh）或硅基流动（Qwen3-VL-Embedding-8B）
+- **时序知识图谱**：实体 + 关系 + 时间维度，多跳推理 BFS，自动从对话抽取实体关系（中文否定检测）
+- **级联路由（RouteLLM）**：简单问题走小模型（降本 85%），复杂问题走大模型，质量升级机制
+- **多后端冗余**：可选接入 Obsidian/思源笔记/Hindsight/Zep，RRF 结果融合
+- **数据集导入**：JSON/JSONL/CSV/TXT 四种格式批量导入，V2→V3 一键迁移
 
 ### 🛠️ 内置工具（28+）
 
-| 类别 | 工具 |
-|------|------|
-| **网络搜索** | web_search、fetch_latest_info（15+ 搜索引擎：SearXNG/Brave/Tavily/DuckDuckGo/Google/Bing/Exa/Firecrawl/Gemini/Grok/Kimi/MiniMax/Ollama） |
-| **代码执行** | exec、run_code（Python/JavaScript/Rust 沙箱）、git_ops、docker_ops、process_manage |
-| **文件操作** | read_file、write_file、read_document（PDF/Word/Excel/PPT）、file_hash、backup_create |
-| **网络安全** | port_scan、http_probe、vuln_scan、dns_lookup、ssl_check、subdomain_enum、waf_detect、sqli_scan、xss_scan、exposure_analysis |
-| **运维诊断** | get_host_load、get_host_processes、host_du_summary、host_find_large_files、host_stat_file、host_netns_inspect、host_diagnostic_snapshot、service_monitor、log_analyze、network_trace |
-| **多模态** | analyze_image（OpenAI Vision）、transcribe_audio（Whisper）、TTS（OpenAI/Edge/Azure/ElevenLabs） |
-| **Agent 协作** | spawn_subagent、fan_out、delegate_task、memory_save |
-
-### 📊 可视化运维
-
-- **运维大屏**：设备在线/掉线/高延迟/有风险统计、ECharts 地图、延迟趋势、风险排行榜、30s 自动轮询
-- **工作流编辑器**：可视化节点编辑、条件分支配置、检查点回滚、执行轨迹查看
-- **审批中心**：审批实例列表、多级进度、决策历史、IM 通知状态
-- **配置编辑器**：傻瓜式表单（Provider/Gateway/Models/Channels/Search/TTS）+ JSON 高级模式 + 自定义路径
+- **命令执行**：exec（审批控制）/ read_file / write_file / run_code
+- **网络搜索**：15+ 搜索引擎（Google/Bing/Brave/DuckDuckGo/SearXNG/Baidu/360/搜狗/知乎/微信/头条/小红书/B站/维基/微博）
+- **文档解析**：read_document（PDF/DOCX/PPTX/XLSX/CSV/TXT/Markdown）
+- **图像分析**：analyze_image（多模态视觉模型）
+- **语音转写**：transcribe_audio（Whisper API / 本地）
+- **网页浏览**：browse / fetch_latest_info / web_search
+- **安全工具**：WAF 检测 / 漏洞扫描 / SQLi 扫描 / XSS 扫描 / 端口扫描 / 暴露面分析 / DNS 查询 / SSL 检查 / 子域名枚举
+- **运维工具**：文件管理 / 进程管理 / 服务管理 / 防火墙 / SSL 证书 / Docker / Git / 备份 / 主机负载 / 日志分析 / 性能分析
 
 ### 👥 多账号权限
 
-- **5 种预置角色**：admin/manager/supervisor/operator/viewer
-- **自定义角色**：可增删改，scopes 权限精确到每个操作
-- **JWT 认证**：HMAC-SHA256，7 天有效期
-- **细粒度权限**：支持通配符（`approval.*`、`sessions.read`）
+- **多用户**：独立账号/密码/角色，细粒度 scopes（chat/sessions/memory/tools/approval/channels/config/users/workflows/logs/admin）
+- **角色管理**：预置角色（admin/manager/supervisor/operator/viewer）+ 自定义角色（名称/描述/颜色/权限树）
+- **审批工作流**：按角色路由审批（主管→经理→管理员），超时自动拒绝
+- **个人中心**：资料/安全（改密码+二步验证）/偏好（主题/语言/折叠）/API Token
+- **首次引导**：类似 OpenClaw，首次启用问名字/角色/偏好，自动保存到记忆库
 
----
+### 🎨 Materialize 设计系统
+
+- **紫色主色**：#8c57ff（Materialize Bootstrap 5 模板完整移植）
+- **侧栏**：白色底 + 靶心小圆点切换折叠（双环=展开/单环=折叠），hover 浮出展开，滚轮滑动
+- **顶栏**：语言切换 / 主题三态（浅/深/跟随系统）/ 快捷入口 / 真实通知（待审批+系统事件）/ 用户头像下拉
+- **卡片**：6px 圆角 + 柔和阴影 + hover 浮起，统计图标彩色圆角方块
+- **暗色主题**：深紫黑 #28243d + 毛玻璃 backdrop-filter
 
 ## 🏗️ 技术架构
 
 ```
-┌─────────────────────────────────────────┐
-│           Vue3 + Arco Design Pro         │
-│  （运维大屏 / 工作流 / 审批 / 配置 / 用户）  │
-├─────────────────────────────────────────┤
-│      WebSocket JSON-RPC (197+ 方法)      │
-├─────────────────────────────────────────┤
-│  CradleRing Gateway (Rust 单文件 13k+行)  │
-│  ├── Agent Loop（多轮工具调用+流式输出）    │
-│  ├── 工作流引擎（状态图+检查点+回滚）      │
-│  ├── 审批引擎（多级+IM 渠道+超时自动通过）   │
-│  ├── WAF 规则引擎（OWASP CRS）           │
-│  ├── 命令策略沙箱（6 级分类+白名单）       │
-│  ├── 角色化 Agent（role/goal/backstory）  │
-│  └── 40+ IM 渠道（Webhook+轮询+去重）     │
-├─────────────────────────────────────────┤
-│         文件持久化（JSON/JSONL）          │
-│  sessions/messages/approvals/workflows/  │
-│  users/roles/waf_rules/change_events/    │
-└─────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                      CradleRing Gateway                     │
+├─────────────────────────────────────────────────────────────┤
+│  WebSocket JSON-RPC (200+ methods) + HTTP REST              │
+│  ├─ WS 认证（hello/connect + JWT/网关 token）              │
+│  ├─ Origin 检查（防跨站 WS 攻击）                           │
+│  └─ 30s 未认证超时断开                                      │
+├─────────────────────────────────────────────────────────────┤
+│  Agent Loop                                                 │
+│  ├─ Cache-First（L1 精确 → L2 语义 → L4 向量）            │
+│  ├─ 记忆召回注入 system prompt                              │
+│  ├─ 级联路由（简单→小模型，复杂→大模型）                   │
+│  ├─ 工具并行执行（FuturesUnordered）                        │
+│  └─ 回答写缓存（下次 0 成本）                               │
+├─────────────────────────────────────────────────────────────┤
+│  Memory Engine V3                                           │
+│  ├─ Embedding（本地哈希 / SiliconFlow API）                │
+│  ├─ Vector Store（纯 Rust 余弦 + JSONL 持久化）            │
+│  ├─ Temporal Knowledge Graph（实体/关系/时间）              │
+│  ├─ Cascading Router（RouteLLM 启发式难度评估）             │
+│  └─ Multi-Backend RRF（Obsidian/思源/Hindsight/Zep）        │
+├─────────────────────────────────────────────────────────────┤
+│  Security Center                                            │
+│  ├─ WAF（50+ OWASP CRS 规则 + 自定义 CRUD + 事件日志）      │
+│  ├─ IDS/IPS（bruteforce/portscan/malware/C2 + 自动封禁）    │
+│  ├─ IP 黑白名单（CIDR）                                     │
+│  ├─ Rate Limit（按 IP 限流）                                │
+│  └─ Login 2FA（TOTP / 邮件验证码）                          │
+├─────────────────────────────────────────────────────────────┤
+│  Channel Manager（40+ IM 渠道真实连接 + Webhook 密钥）       │
+├─────────────────────────────────────────────────────────────┤
+│  Node Manager（SSH 节点 + 一键安装代码 + 心跳上报）           │
+├─────────────────────────────────────────────────────────────┤
+│  Workflow Engine（LangGraph 状态图 + 检查点 + 回滚）          │
+├─────────────────────────────────────────────────────────────┤
+│  Approval Engine（多级审批 + 审批流模板 + 超时拒绝）           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**核心亮点**：
-- **单二进制部署**：Rust 编译，无运行时依赖（Node/Python 不需要）
-- **高性能**：tokio 异步运行时，流式 LLM 调用（SSE 解析），并行工具执行
-- **无损压缩**：LLM 摘要 + 实体保留 + 检查点恢复，突破上下文长度限制
+### 技术栈
 
----
+- **后端**：Rust 1.70+（单二进制，零外部服务依赖）
+- **前端**：Vue 3 + Arco Design Pro + Vite + ECharts
+- **存储**：JSON 文件（sessions/messages/memory/config/users/roles）+ JSONL（messages/security_events）
+- **向量检索**：纯 Rust 余弦相似度（可选 Qdrant embedded 后续接入）
+- **Embedding**：本地哈希降维（零依赖）/ SiliconFlow Qwen3-VL-Embedding-8B
+- **TOTP**：纯 Rust Base32 + HMAC-SHA1 + TOTP（零 crate）
+- **SMTP**：纯 TCP 手工协议（EHLO/AUTH LOGIN/MAIL FROM/RCPT TO/DATA）
 
-## 📖 文档
+## 📦 安装后配置
 
-| 文档 | 说明 |
-|------|------|
-| [安装指南](docs/install.md) | 详细安装步骤（systemd/launchd 自启） |
-| [配置说明](docs/config.md) | 配置文件结构和示例 |
-| [API 文档](docs/api.md) | WebSocket JSON-RPC 197+ 方法 |
-| [工作流指南](docs/workflow.md) | 状态图引擎使用教程 |
-| [审批流程](docs/approval.md) | 多级审批配置和 IM 渠道审批 |
-| [运维手册](docs/ops.md) | WAF/审计/大屏使用指南 |
+### 首次登录
 
----
+安装完成后，浏览器打开 `http://127.0.0.1:18800`，使用安装时生成的随机凭据登录（保存在 `~/.cradle-ring/data/.admin_credentials`）。
 
-## 🔧 开发
+首次登录后进入**首次设置向导**（OpenClaw 风格）：
+1. 问名字（怎么称呼你）
+2. 问角色（运维/开发/安全/其他）
+3. 问偏好（重点帮你做什么）
 
-### 环境要求
+自动保存到用户资料和记忆库，后续对话会记住你的偏好。
 
-- Rust 1.70+
-- Node.js 20+ / pnpm（前端构建）
-- Linux / macOS（Windows 支持开发中）
+### 配置大模型
 
-### 本地开发
+**方式一：交互式配置（推荐）**
 
-```bash
-# 后端
-cd crates/cradle-ring
-cargo run --bin cradle-ring gateway start
+安装时自动进入配置向导，选择模型 Provider（20 个国产+国际预设），填 API Key，测试连接，保存。
 
-# 前端（开发模式）
-cd webui
-pnpm install
-pnpm dev
+**方式二：配置文件**
 
-# 前端（生产构建）
-pnpm build
+编辑 `~/.cradle-ring/cradle-ring.json`：
+
+```json
+{
+  "providers": {
+    "deepseek": {
+      "apiKey": "sk-...",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat"
+    }
+  },
+  "models": { "primary": "deepseek-chat" }
+}
 ```
 
-### 项目结构
+**方式三：网关页面**
 
+登录后进入「接入配置 → 系统配置 → 大模型」，20 个服务商预设网格，点击即添加自动填充，只填 Key，测试连接，保存。
+
+### 配置 Embedding（记忆系统）
+
+**本地模式（零成本）**：默认启用，无需配置。首次使用自动下载 bge-small-zh-v1.5（~100MB）。
+
+**API 模式（硅基流动）**：
+
+```json
+{
+  "memory": {
+    "embedding": {
+      "provider": "siliconflow",
+      "model": "Qwen/Qwen3-VL-Embedding-8B",
+      "baseUrl": "https://api.siliconflow.cn/v1",
+      "apiKey": "sk-..."
+    }
+  }
+}
 ```
-CradleRing/
-├── crates/cradle-ring/     # 主二进制（网关+Agent+工具）
-├── packages/               # 21 个内部 Rust crate
-│   ├── gateway-protocol/   # WebSocket 协议定义
-│   ├── agent-core/         # Agent 核心类型
-│   └── ...
-├── webui/                  # Vue3 + Arco Design Pro 前端
-│   ├── src/pages/          # 20+ 页面
-│   ├── src/layout/         # 布局组件
-│   └── src/stores/         # Pinia 状态
-└── install.sh              # 一键安装脚本
-```
 
----
+### 配置 IM 渠道
 
-## 📜 开源协议
+登录后进入「接入配置 → 渠道」，点击渠道卡片配置：
+- **飞书**：App ID + App Secret + Verification Token
+- **Telegram**：Bot Token（@BotFather 创建）
+- **Discord**：Bot Token
+- **钉钉**：App Key + App Secret
+- **企业微信**：Corp ID + Agent ID + Secret
+- **Slack**：Bot Token + Signing Secret
+- **WhatsApp**：Access Token + Phone Number ID
+- **其他 30+**：按提示填写
 
-**CradleRing 商业源码许可协议（Business Source License 1.1 修改版）**
+**测试连接**：点击「测试连接」真实调平台 API 验证凭据（不再假通过）。
 
-### ✅ 允许
+**Webhook 密钥**：可选启用，回调 URL 带密钥防伪造消息注入。
 
-- **企业使用**：企业内部可自由部署和使用，无限制
-- **二次开发商用**：可基于 CradleRing 开发自己的产品并销售
-- **学习研究**：可自由阅读、学习、研究源代码
+### 配置二步验证（可选）
 
-### ❌ 禁止
+登录后进入「个人中心 → 安全 → 二步验证」：
+- **TOTP 谷歌身份验证器**：生成密钥 + 扫码添加 → 输入 6 位验证码启用
+- **邮件验证码**：配置 SMTP 后，登录时发送 6 位验证码到邮箱
 
-- **二次开发后收费**：不得将 CradleRing 修改后作为 SaaS 服务收费（即不得提供"CradleRing 托管服务"）
-- **去除版权信息**：不得移除或修改源代码中的版权和许可声明
+### 配置节点集群
 
-### 具体条款
+登录后进入「运维管理 → 节点管理」：
+1. 添加 SSH 节点（名称/主机/端口/用户/密钥或密码）
+2. 测试连接
+3. 生成一键安装代码（复制到目标机器执行，自动注册 + 心跳上报）
+4. 监控大屏/环境部署/文件管理/进程管理/服务管理均可切换节点查看
 
-1. **使用**：任何个人或组织可在内部使用 CradleRing，包括生产环境
-2. **修改**：可自由修改源代码以满足自身需求
-3. **分发**：可分发修改后的版本，但必须保留原始版权和许可声明
-4. **商用限制**：不得将 CradleRing 或其修改版本作为**服务**（SaaS）向第三方收费提供
-5. **专利授权**：贡献者授予使用其专利的免费许可
+## 🔐 安全说明
 
-**例外**：如需将 CradleRing 作为 SaaS 服务提供，请联系 [cradlering@example.com](mailto:cradlering@example.com) 获取商业授权。
+- **WS 认证**：WebSocket 首帧必须 hello/connect 携带 JWT 或网关 token，未认证拒绝一切 RPC
+- **Origin 检查**：浏览器跨站 WS 攻击防护
+- **登录限流**：失败 5 次锁定 5 分钟
+- **命令注入防护**：所有外部命令参数化调用，输入字符白名单
+- **路径穿越防护**：文件管理 canonicalize 真实路径 + 白名单
+- **SSRF 防护**：出站请求 DNS 解析后 IP 检查（防云元数据窃取）
+- **Webhook 密钥**：渠道回调防伪造注入
+- **密码哈希**：salted SHA-256 + 常数时间比较
+- **JWT**：手工 HMAC-SHA256，7 天有效，密钥 OsRng 生成
+- **敏感信息**：启动日志脱敏，配置不回显密码
 
----
+## 📄 License
 
-## 🤝 贡献
+商业源码许可（见 LICENSE 文件）
 
-欢迎提交 Issue 和 Pull Request！
+## 🙏 致谢
 
-1. Fork 本仓库
-2. 创建功能分支 (`git checkout -b feature/amazing`)
-3. 提交更改 (`git commit -m 'feat: amazing feature'`)
-4. 推送到分支 (`git push origin feature/amazing`)
-5. 创建 Pull Request
-
----
-
-## 📝 更新日志
-
-### v0.0.1（2026-07-17）
-
-**初始发布**
-
-- ✅ 多 Agent 编排引擎（状态图+角色化+流水线+并行）
-- ✅ WAF 安全防护（OWASP CRS 规则+类型识别）
-- ✅ 多级审批工作流（IM 渠道审批）
-- ✅ 40+ IM 渠道真实连接
-- ✅ 28+ 内置工具（搜索/代码/文件/网络/运维/多模态）
-- ✅ 运维大屏（设备状态+延迟趋势+风险排行）
-- ✅ 可视化工作流编辑器
-- ✅ 傻瓜式配置编辑器（双模式）
-- ✅ 多账号权限（预置+自定义角色）
-- ✅ 命令策略沙箱（6 级分类+白名单）
-- ✅ AI SOP 二审（高危操作自动审查）
-- ✅ 变更事件审计（RCA 根因分析）
-
----
-
-**CradleRing** — 让 AI Agent 真正为企业所用 🚀
+- [Materialize](https://themeselection.com/item/materio-dashboard-pro-bootstrap/) — UI 设计系统
+- [OpenClaw](https://github.com/openclaw/openclaw) — 产品灵感（本项目是 Rust 1:1 功能复刻）
+- [Qdrant](https://qdrant.tech/) — 向量数据库（后续接入）
+- [Zep/Graphiti](https://arxiv.org/abs/2501.13956) — 时序知识图谱灵感
+- [RouteLLM](https://github.com/lm-sys/RouteLLM) — 级联路由方案

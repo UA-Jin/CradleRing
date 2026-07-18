@@ -10,10 +10,10 @@
             <div class="ch-info">
               <div class="ch-name">
                 {{ ch.label }}
-                <a-badge :status="ch.state?.enabled ? (ch.state?.status === 'connected' ? 'success' : (ch.state?.status === 'error' ? 'danger' : 'warning')) : 'default'" />
+                <a-badge :status="ch.enabled ? (ch.state?.status === 'connected' ? 'success' : (ch.state?.status === 'error' ? 'danger' : 'warning')) : 'default'" />
               </div>
               <div class="ch-status">{{ statusText(ch) }}</div>
-              <div class="ch-stats" v-if="ch.state?.enabled">
+              <div class="ch-stats" v-if="ch.enabled">
                 <span>收 {{ ch.state?.receivedCount || 0 }}</span>
                 <span>发 {{ ch.state?.sentCount || 0 }}</span>
               </div>
@@ -208,25 +208,26 @@ const webhookUrl = computed(() => {
 });
 
 function statusText(ch: Channel) {
-  if (!ch.state?.enabled) return '未启用';
+  if (!ch.enabled) return '未启用';
   const s = ch.state?.status;
-  return ({ configured: '已配置', connected: '已连接', disconnected: '未连接', error: '错误', polling: '轮询中' } as any)[s] || s;
+  return ({ configured: '已配置', connected: '已连接', disconnected: '未连接', error: '错误', polling: '轮询中' } as any)[s] || '已配置';
 }
 
 async function load() {
   try {
-    const [channelsRes, statesRes] = await Promise.all([
-      rpc.call<{ channels: any[] }>('channels.list').catch(() => ({ channels: [] })),
-      rpc.call<{ states: any }>('channels.states').catch(() => ({ states: {} })),
-    ]);
-    const cfgMap = new Map((channelsRes.channels || []).map((c: any) => [c.id, c]));
+    // 用 channels.status（含完整配置 + 运行时状态），不用不存在的 channels.states
+    const res = await rpc.call<any>('channels.status');
+    const channelsMap = res.channels || {};
+    const labelsMap = res.labels || {};
     channels.value = channelDefs.map((d) => {
-      const cfg = cfgMap.get(d.id) || {};
+      const cfg = channelsMap[d.id] || {};
+      const enabled = !!cfg.enabled;
       return {
         ...d,
-        enabled: !!cfg.enabled,
-        config: { ...cfg },
-        state: statesRes.states?.[d.id] || { status: cfg.enabled ? 'configured' : 'disconnected', enabled: !!cfg.enabled },
+        label: labelsMap[d.id] || d.label,
+        enabled,
+        config: { ...(cfg.config || cfg) },
+        state: { status: cfg.status || (enabled ? 'configured' : 'disconnected'), enabled },
       };
     });
   } catch (e) {
@@ -242,10 +243,14 @@ function openEdit(ch: Channel) {
 
 async function toggle(ch: Channel) {
   try {
-    await rpc.call('channels.set', { id: ch.id, enabled: ch.enabled });
+    await rpc.call('channels.set', { id: ch.id, enabled: ch.enabled, config: ch.config });
     Message.success(ch.enabled ? '已启用' : '已禁用');
+    // 重新加载同步状态（修复：toggle 后 UI 不刷新的问题）
+    await load();
   } catch (e: any) {
     Message.error(e.message);
+    // 失败时回滚 switch
+    ch.enabled = !ch.enabled;
   }
 }
 

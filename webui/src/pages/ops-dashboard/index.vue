@@ -11,6 +11,16 @@
       </div>
       <div class="header-right">
         <a-space>
+          <!-- 节点选择器（主机监控数据源） -->
+          <a-select v-model="currentNodeId" style="width: 220px" @change="loadHostStats" size="small">
+            <template #prefix>
+              <span style="font-size:12px;color:var(--color-text-3)">监控节点</span>
+            </template>
+            <a-option value="local">本机</a-option>
+            <a-option v-for="n in availableNodes" :key="n.id" :value="n.id">
+              {{ n.name }}（{{ n.host }}）
+            </a-option>
+          </a-select>
           <a-button @click="refresh"><template #icon><icon-refresh /></template>刷新</a-button>
           <a-button @click="toggleFullscreen">
             <template #icon><icon-fullscreen v-if="!isFullscreen" /><icon-fullscreen-exit v-else /></template>
@@ -367,11 +377,21 @@ const hostStats = ref<any>(null);
 const currentNodeId = ref('local');
 const sshNodes = ref<any[]>([]);
 
+// 可选节点：只显示在线的（远程节点离线时回退本机）
+const availableNodes = computed(() =>
+  sshNodes.value.filter((n) => n.status === 'online' || n.id === currentNodeId.value),
+);
+
 async function loadHostStats() {
   try {
-    hostStats.value = await rpc.call<any>('host.stats', { nodeId: currentNodeId.value });
+    const res = await rpc.call<any>('host.stats', { nodeId: currentNodeId.value });
+    hostStats.value = res;
   } catch (e) {
-    // 首次可能失败
+    // 节点不可达时回退本机
+    if (currentNodeId.value !== 'local') {
+      currentNodeId.value = 'local';
+      hostStats.value = await rpc.call<any>('host.stats', { nodeId: 'local' }).catch(() => null);
+    }
   }
 }
 

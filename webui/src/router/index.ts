@@ -50,6 +50,7 @@ const routes: RouteRecordRaw[] = [
           { path: '/files', name: 'Files', component: () => import('@/pages/files/index.vue'), meta: { label: '文件管理', icon: 'icon-folder' } },
           { path: '/process', name: 'Process', component: () => import('@/pages/process/index.vue'), meta: { label: '进程管理', icon: 'icon-layers' } },
           { path: '/services', name: 'Services', component: () => import('@/pages/services/index.vue'), meta: { label: '服务管理', icon: 'icon-tool' } },
+          { path: '/security', name: 'Security', component: () => import('@/pages/security/index.vue'), meta: { label: '安全中心', icon: 'icon-safe' } },
           { path: '/firewall', name: 'Firewall', component: () => import('@/pages/firewall/index.vue'), meta: { label: '防火墙', icon: 'icon-safe' } },
           { path: '/audit', name: 'Audit', component: () => import('@/pages/audit/index.vue'), meta: { label: '运维审计', icon: 'icon-safe' } },
         ],

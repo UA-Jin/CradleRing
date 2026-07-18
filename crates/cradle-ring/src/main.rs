@@ -658,6 +658,27 @@ struct Node {
     /// 上报的内存使用率（%）
     #[serde(default)]
     mem_percent: Option<u32>,
+    /// SSH 主机地址（运维节点）
+    #[serde(default)]
+    host: String,
+    /// SSH 端口
+    #[serde(default)]
+    port: u16,
+    /// SSH 登录用户
+    #[serde(default)]
+    user: String,
+    /// 认证方式：key | password
+    #[serde(default)]
+    auth_type: String,
+    /// SSH 私钥（auth_type=key 时）
+    #[serde(default)]
+    private_key: String,
+    /// SSH 密码（auth_type=password 时）
+    #[serde(default)]
+    password: String,
+    /// agent 通讯令牌（nodes.register 注册后分配，heartbeat/report 校验用）
+    #[serde(default)]
+    node_token: String,
 }
 
 fn default_node_status() -> String { "paired".to_string() }
@@ -1967,6 +1988,45 @@ impl Storage {
         }
     }
 
+    // ---- 安全中心：统一安全事件（JSONL）----
+
+    fn security_events_path(&self) -> String {
+        format!("{}/.cradle-ring/data/security_events.jsonl", self.home)
+    }
+    fn append_security_event(&self, ev: &SecurityEvent) {
+        use std::io::Write;
+        if let Ok(data) = serde_json::to_string(ev) {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.security_events_path()) {
+                let _ = writeln!(f, "{}", data);
+            }
+        }
+    }
+    fn load_security_events(&self, limit: usize) -> Vec<SecurityEvent> {
+        if let Ok(data) = std::fs::read_to_string(self.security_events_path()) {
+            let all: Vec<SecurityEvent> = data.lines().filter(|l| !l.is_empty())
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            let start = all.len().saturating_sub(limit);
+            all[start..].to_vec()
+        } else { vec![] }
+    }
+
+    // ---- 安全中心：封禁 IP 持久化 ----
+
+    fn banned_ips_path(&self) -> String {
+        format!("{}/.cradle-ring/data/banned_ips.json", self.home)
+    }
+    fn load_banned_ips(&self) -> Vec<BanEntry> {
+        if let Ok(data) = std::fs::read_to_string(self.banned_ips_path()) {
+            serde_json::from_str(&data).unwrap_or_default()
+        } else { vec![] }
+    }
+    fn save_banned_ips(&self, items: &[BanEntry]) {
+        if let Ok(data) = serde_json::to_string_pretty(items) {
+            let _ = std::fs::write(self.banned_ips_path(), data);
+        }
+    }
+
     /// artifacts 目录
     fn artifacts_dir(&self) -> String {
         let p = format!("{}/.cradle-ring/data/artifacts", self.home);
@@ -2104,7 +2164,6 @@ impl ChannelManager {
 // ============================================================================
 // 全局状态
 // ============================================================================
-
 struct AppState {
     config: Config,
     storage: Storage,
@@ -2130,6 +2189,12 @@ struct AppState {
     /// 运行时配置覆盖层：channels.set 等 RPC 修改配置后立即生效（无需重启）。
     /// 读取时与 config.raw_json 深度合并（override 优先）。
     config_override: tokio::sync::RwLock<serde_json::Value>,
+    /// 待注册的节点 agent 一次性 token：token -> (node_name, expires_at_ms)（10 分钟有效）
+    nodes_pending: tokio::sync::Mutex<HashMap<String, (String, i64)>>,
+    /// 节点最新上报指标：node_id -> metrics JSON（CPU/内存/磁盘/负载/网络）
+    node_metrics: tokio::sync::Mutex<HashMap<String, serde_json::Value>>,
+    /// 安全中心运行时统计（WAF/IDS/黑名单/限流 拦截计数 + 请求行为计数器）
+    security_stats: tokio::sync::Mutex<SecurityStats>,
 }
 
 impl AppState {
@@ -2149,6 +2214,9 @@ impl AppState {
             login_attempts: tokio::sync::Mutex::new(HashMap::new()),
             twofa_codes: tokio::sync::Mutex::new(HashMap::new()),
             config_override: tokio::sync::RwLock::new(serde_json::json!({})),
+            nodes_pending: tokio::sync::Mutex::new(HashMap::new()),
+            node_metrics: tokio::sync::Mutex::new(HashMap::new()),
+            security_stats: tokio::sync::Mutex::new(SecurityStats::new()),
         });
         state
     }
@@ -2340,10 +2408,20 @@ async fn handle_http(
     stream: &mut tokio::net::TcpStream,
     request: &str,
     state: Arc<AppState>,
+    peer_ip: &str,
 ) {
     let first_line = request.lines().next().unwrap_or("");
     let path = first_line.split_whitespace().nth(1).unwrap_or("/");
     let method = first_line.split_whitespace().next().unwrap_or("GET");
+
+    // 安全中心统一入口：白名单放行 → 黑名单/封禁阻断 → 速率限制 → WAF 规则 → IDS 行为分析
+    let client_ip = extract_client_ip(request, peer_ip);
+    let http_body = String::from_utf8_lossy(&extract_http_body(request)).to_string();
+    if let Some(block) = security_check_request(&state, &client_ip, path, request, &http_body).await {
+        let b = block.to_string();
+        send_response(stream, 403, "Forbidden", "application/json", b.as_bytes()).await;
+        return;
+    }
 
     // 用于静态文件查找的路径：去掉 query string（如 /sw.js?v=1.2 -> /sw.js）
     let fs_path = match path.find(|c| c == '?' || c == '#') {
@@ -2479,6 +2557,36 @@ async fn handle_http(
             None => {
                 send_response(stream, 401, "Unauthorized", "application/json",
                     b"{\"ok\":false,\"error\":{\"code\":\"UNAUTHORIZED\"}}").await;
+            }
+        }
+        return;
+    }
+
+    // ---- Agent HTTP RPC 桥（节点一键安装脚本的注册/心跳回调入口）----
+    // 白名单仅放行 nodes.register / nodes.heartbeat，避免 HTTP 侧未授权暴露全部 RPC；
+    // 安全性由一次性注册 token 与 node_token 校验保证（见 handle_rpc 对应分支）
+    if method == "POST" && path.starts_with("/api/agent/rpc") {
+        let body = extract_http_body(request);
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        let rpc_method = payload["method"].as_str().unwrap_or("");
+        if !matches!(rpc_method, "nodes.register" | "nodes.heartbeat") {
+            let b = serde_json::json!({"ok": false, "error": {"code": "FORBIDDEN", "message": "该方法不允许通过 agent 桥调用"}}).to_string();
+            send_response(stream, 403, "Forbidden", "application/json", b.as_bytes()).await;
+            return;
+        }
+        let result = handle_rpc(state.clone(), rpc_method, payload["params"].clone()).await;
+        let resp = serde_json::json!({"ok": true, "payload": result}).to_string();
+        send_response(stream, 200, "OK", "application/json", resp.as_bytes()).await;
+        return;
+    }
+
+    // GET /api/agent/download：下发 agent 二进制（当前 cradle-ring 程序本身，节点侧以 `agent run` 运行）
+    if method == "GET" && path.starts_with("/api/agent/download") {
+        match std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()) {
+            Some(bytes) => send_response(stream, 200, "OK", "application/octet-stream", &bytes).await,
+            None => {
+                let b = serde_json::json!({"ok": false, "error": {"code": "NO_BINARY", "message": "无法读取 agent 二进制"}}).to_string();
+                send_response(stream, 500, "Internal Server Error", "application/json", b.as_bytes()).await;
             }
         }
         return;
@@ -4381,6 +4489,9 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 metadata: req_clone.metadata.clone(),
                 latency_ms: None, risk_score: 0, risk_reasons: vec![],
                 last_heartbeat: None, cpu_percent: None, mem_percent: None,
+                host: String::new(), port: 22, user: String::new(),
+                auth_type: String::new(), private_key: String::new(),
+                password: String::new(), node_token: String::new(),
             };
             nodes.push(node.clone());
             state.storage.save_nodes(&nodes);
@@ -5443,6 +5554,9 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 metadata: req_clone.metadata.clone(),
                 latency_ms: None, risk_score: 0, risk_reasons: vec![],
                 last_heartbeat: None, cpu_percent: None, mem_percent: None,
+                host: String::new(), port: 22, user: String::new(),
+                auth_type: String::new(), private_key: String::new(),
+                password: String::new(), node_token: String::new(),
             };
             nodes.push(node.clone());
             state.storage.save_nodes(&nodes);
@@ -5522,6 +5636,9 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 metadata: req_clone.metadata.clone(),
                 latency_ms: None, risk_score: 0, risk_reasons: vec![],
                 last_heartbeat: None, cpu_percent: None, mem_percent: None,
+                host: String::new(), port: 22, user: String::new(),
+                auth_type: String::new(), private_key: String::new(),
+                password: String::new(), node_token: String::new(),
             };
             nodes.push(node.clone());
             state.storage.save_nodes(&nodes);
@@ -6920,6 +7037,9 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                         metadata: serde_json::Value::Null,
                         latency_ms: None, risk_score: 0, risk_reasons: vec![],
                         last_heartbeat: None, cpu_percent: None, mem_percent: None,
+                        host: String::new(), port: 22, user: String::new(),
+                        auth_type: String::new(), private_key: String::new(),
+                        password: String::new(), node_token: String::new(),
                     });
                     nodes.last_mut().unwrap()
                 }
@@ -7887,14 +8007,14 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
         // WAF 安全能力（对标 ModSecurity + ongrid 安全运维）
         // ====================================================================
 
-        "waf.rules.list" => {
+        "waf.rules.list" | "security.waf.rules.list" => {
             let rules = state.storage.load_waf_rules();
             json!({
                 "rules": rules.iter().map(waf_rule_to_json).collect::<Vec<_>>(),
                 "count": rules.len(),
             })
         }
-        "waf.rules.create" => {
+        "waf.rules.create" | "security.waf.rules.create" => {
             let name = params["name"].as_str().unwrap_or("").to_string();
             let pattern = params["pattern"].as_str().unwrap_or("").to_string();
             if name.is_empty() || pattern.is_empty() {
@@ -7922,7 +8042,7 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             state.storage.save_waf_rules(&rules);
             json!({"ok": true, "rule": waf_rule_to_json(&r_clone)})
         }
-        "waf.rules.update" => {
+        "waf.rules.update" | "security.waf.rules.update" => {
             let id = params["id"].as_str().unwrap_or("").to_string();
             let mut rules = state.storage.load_waf_rules();
             let r = match rules.iter_mut().find(|r| r.id == id) {
@@ -7939,8 +8059,12 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             state.storage.save_waf_rules(&rules);
             json!({"ok": true, "rule": waf_rule_to_json(&r_clone)})
         }
-        "waf.rules.delete" => {
+        "waf.rules.delete" | "security.waf.rules.delete" => {
             let id = params["id"].as_str().unwrap_or("").to_string();
+            // 安全中心命名空间下：内置 OWASP CRS 规则不可删除，只能禁用
+            if method.starts_with("security.") && !id.contains("custom") {
+                return json!({"ok": false, "error": {"code": "BUILTIN_RULE", "message": "内置规则不可删除，请使用 security.waf.rules.toggle 禁用"}});
+            }
             let mut rules = state.storage.load_waf_rules();
             let before = rules.len();
             rules.retain(|r| r.id != id);
@@ -7948,7 +8072,7 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             state.storage.save_waf_rules(&rules);
             json!({"ok": true})
         }
-        "waf.rules.toggle" => {
+        "waf.rules.toggle" | "security.waf.rules.toggle" => {
             let id = params["id"].as_str().unwrap_or("").to_string();
             let mut rules = state.storage.load_waf_rules();
             let r = match rules.iter_mut().find(|r| r.id == id) {
@@ -7989,6 +8113,12 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                         matched_text: m.matched_text.clone(),
                         ts: current_ms(),
                     });
+                    // 同步写入统一安全事件流
+                    state.storage.append_security_event(&new_security_event(
+                        "waf", &m.rule_type, &m.action, &m.severity,
+                        params["sourceIp"].as_str().unwrap_or("unknown"), &url,
+                        &m.rule_id, &m.rule_name, &format!("命中: {}", m.matched_text),
+                    ));
                 }
             }
             json!({
@@ -8013,6 +8143,34 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 "count": events.len(),
             })
         }
+        "security.waf.events" => {
+            // 统一安全事件流中的 WAF 事件（最近 100 条默认）
+            let limit = params["limit"].as_u64().unwrap_or(100) as usize;
+            let events = state.storage.load_security_events(5000);
+            let filtered: Vec<_> = events.iter().filter(|e| e.category == "waf").collect();
+            let start = filtered.len().saturating_sub(limit);
+            json!({
+                "events": filtered[start..].iter().rev().map(|e| security_event_to_json(e)).collect::<Vec<_>>(),
+                "count": filtered.len().min(limit),
+            })
+        }
+        "security.waf.test" => {
+            // 干跑测试：检测请求是否会被 WAF 拦截（不更新命中计数、不记录事件）
+            let url = params["url"].as_str().unwrap_or("").to_string();
+            let headers = params["headers"].as_str().unwrap_or("").to_string();
+            let body = params["body"].as_str().unwrap_or("").to_string();
+            let rules = state.storage.load_waf_rules();
+            let matches = waf_check_request(&rules, &url, &headers, &body);
+            json!({
+                "ok": true,
+                "blocked": matches.iter().any(|m| m.action == "block"),
+                "matches": matches.iter().map(|m| json!({
+                    "ruleId": m.rule_id, "ruleName": m.rule_name, "ruleType": m.rule_type,
+                    "action": m.action, "severity": m.severity, "matchedText": m.matched_text,
+                })).collect::<Vec<_>>(),
+                "count": matches.len(),
+            })
+        }
         "waf.stats" => {
             let rules = state.storage.load_waf_rules();
             let events = state.storage.load_waf_events(1000);
@@ -8032,14 +8190,14 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
         // 入侵检测防护（IDS/IPS）
         // ====================================================================
 
-        "ids.rules.list" => {
+        "ids.rules.list" | "security.ids.rules.list" => {
             let rules = state.storage.load_ids_rules();
             json!({
                 "rules": rules.iter().map(ids_rule_to_json).collect::<Vec<_>>(),
                 "count": rules.len(),
             })
         }
-        "ids.rules.create" => {
+        "ids.rules.create" | "security.ids.rules.create" => {
             let name = params["name"].as_str().unwrap_or("").to_string();
             let pattern = params["pattern"].as_str().unwrap_or("").to_string();
             if name.is_empty() || pattern.is_empty() {
@@ -8064,7 +8222,7 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             state.storage.save_ids_rules(&rules);
             json!({"ok": true, "rule": ids_rule_to_json(&r_clone)})
         }
-        "ids.rules.update" => {
+        "ids.rules.update" | "security.ids.rules.update" => {
             let id = params["id"].as_str().unwrap_or("").to_string();
             let mut rules = state.storage.load_ids_rules();
             let r = match rules.iter_mut().find(|r| r.id == id) {
@@ -8082,14 +8240,69 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             state.storage.save_ids_rules(&rules);
             json!({"ok": true, "rule": ids_rule_to_json(&r_clone)})
         }
-        "ids.rules.delete" => {
+        "ids.rules.delete" | "security.ids.rules.delete" => {
             let id = params["id"].as_str().unwrap_or("").to_string();
+            // 安全中心命名空间下：内置 IDS 规则不可删除，只能禁用
+            if method.starts_with("security.") && !id.contains("custom") {
+                return json!({"ok": false, "error": {"code": "BUILTIN_RULE", "message": "内置规则不可删除，请使用 security.ids.rules.toggle 禁用"}});
+            }
             let mut rules = state.storage.load_ids_rules();
             let before = rules.len();
             rules.retain(|r| r.id != id);
             if rules.len() == before { return json!({"ok": false, "error": {"code": "NOT_FOUND"}}); }
             state.storage.save_ids_rules(&rules);
             json!({"ok": true})
+        }
+        "ids.rules.toggle" | "security.ids.rules.toggle" => {
+            let id = params["id"].as_str().unwrap_or("").to_string();
+            let mut rules = state.storage.load_ids_rules();
+            let r = match rules.iter_mut().find(|r| r.id == id) {
+                Some(r) => r, None => return json!({"ok": false, "error": {"code": "NOT_FOUND"}}),
+            };
+            r.enabled = !r.enabled;
+            let enabled = r.enabled;
+            state.storage.save_ids_rules(&rules);
+            json!({"ok": true, "enabled": enabled})
+        }
+        "security.ids.events" => {
+            // 统一安全事件流中的 IDS 事件（最近 100 条默认）
+            let limit = params["limit"].as_u64().unwrap_or(100) as usize;
+            let events = state.storage.load_security_events(5000);
+            let filtered: Vec<_> = events.iter().filter(|e| e.category == "ids").collect();
+            let start = filtered.len().saturating_sub(limit);
+            json!({
+                "events": filtered[start..].iter().rev().map(|e| security_event_to_json(e)).collect::<Vec<_>>(),
+                "count": filtered.len().min(limit),
+            })
+        }
+        "security.ids.ban" => {
+            let ip = params["ip"].as_str().unwrap_or("");
+            let duration = params["durationSecs"].as_u64().unwrap_or(3600);
+            let reason = params["reason"].as_str().unwrap_or("手动封禁").to_string();
+            if ip.is_empty() { return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 ip"}}); }
+            match security_ban_ip(&state, ip, duration, &reason).await {
+                Ok(msg) => json!({"ok": true, "message": msg, "ip": ip, "durationSecs": duration}),
+                Err(e) => json!({"ok": false, "error": {"message": e}}),
+            }
+        }
+        "security.ids.unban" => {
+            let ip = params["ip"].as_str().unwrap_or("");
+            if ip.is_empty() { return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 ip"}}); }
+            match security_unban_ip(&state, ip).await {
+                Ok(msg) => json!({"ok": true, "message": msg, "ip": ip}),
+                Err(e) => json!({"ok": false, "error": {"message": e}}),
+            }
+        }
+        "security.ids.banned_list" => {
+            let now = current_ms();
+            let bans = state.storage.load_banned_ips();
+            let active: Vec<_> = bans.iter()
+                .filter(|b| b.expires_at.map(|t| t > now).unwrap_or(true))
+                .collect();
+            json!({
+                "banned": active.iter().map(|b| ban_entry_to_json(b)).collect::<Vec<_>>(),
+                "count": active.len(),
+            })
         }
         "ids.events.list" => {
             let limit = params["limit"].as_u64().unwrap_or(50) as usize;
@@ -8110,12 +8323,16 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 let events = ids_check_ssh_bruteforce(&state, r.threshold, r.window_secs).await;
                 for mut ev in events {
                     if r.action == "block" {
-                        match ids_ban_ip(&ev.source, ev.ban_duration_secs).await {
+                        match security_ban_ip(&state, &ev.source, ev.ban_duration_secs, "SSH 暴力破解自动封禁").await {
                             Ok(msg) => { ev.blocked = true; ev.detail = format!("{} (已封禁: {})", ev.detail, msg); }
                             Err(e) => { ev.detail = format!("{} (封禁失败: {})", ev.detail, e); }
                         }
                     }
                     state.storage.append_ids_event(&ev);
+                    state.storage.append_security_event(&new_security_event(
+                        "ids", &ev.event_type, if ev.blocked { "block" } else { "alert" }, &ev.severity,
+                        &ev.source, "", &r.id, &r.name, &ev.detail,
+                    ));
                     all_events.push(ev);
                 }
             }
@@ -8125,6 +8342,10 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 let events = ids_check_malware_process(&patterns).await;
                 for ev in events {
                     state.storage.append_ids_event(&ev);
+                    state.storage.append_security_event(&new_security_event(
+                        "ids", &ev.event_type, "alert", &ev.severity,
+                        &ev.source, "", &r.id, &r.name, &ev.detail,
+                    ));
                     all_events.push(ev);
                 }
             }
@@ -8134,10 +8355,19 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 let events = ids_check_network(&patterns).await;
                 for ev in events {
                     state.storage.append_ids_event(&ev);
+                    state.storage.append_security_event(&new_security_event(
+                        "ids", &ev.event_type, "alert", &ev.severity,
+                        &ev.source, "", &r.id, &r.name, &ev.detail,
+                    ));
                     all_events.push(ev);
                 }
             }
             let blocked_count = all_events.iter().filter(|e| e.blocked).count();
+            {
+                let mut stats = state.security_stats.lock().await;
+                stats.roll_day();
+                stats.ids_detected_today += all_events.len() as u64;
+            }
             json!({
                 "ok": true,
                 "eventsFound": all_events.len(),
@@ -8148,8 +8378,9 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
         "ids.ban" => {
             let ip = params["ip"].as_str().unwrap_or("");
             let duration = params["durationSecs"].as_u64().unwrap_or(3600);
+            let reason = params["reason"].as_str().unwrap_or("手动封禁").to_string();
             if ip.is_empty() { return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 ip"}}); }
-            match ids_ban_ip(ip, duration).await {
+            match security_ban_ip(&state, ip, duration, &reason).await {
                 Ok(msg) => json!({"ok": true, "message": msg}),
                 Err(e) => json!({"ok": false, "error": {"message": e}}),
             }
@@ -8157,18 +8388,9 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
         "ids.unban" => {
             let ip = params["ip"].as_str().unwrap_or("");
             if ip.is_empty() { return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 ip"}}); }
-            // 安全修复：IP 格式校验（防命令注入：ip 可写 "1.1.1.1; id"）
-            if let Err(e) = validate_ip_str(ip) {
-                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": e}});
-            }
-            // 参数化调用，不经 shell
-            let result = tokio::process::Command::new("iptables")
-                .args(["-D", "INPUT", "-s", ip, "-j", "DROP"])
-                .output().await;
-            match result {
-                Ok(o) if o.status.success() => json!({"ok": true, "message": format!("IP {} 已解封", ip)}),
-                Ok(o) => json!({"ok": false, "error": {"message": String::from_utf8_lossy(&o.stderr)}}),
-                Err(e) => json!({"ok": false, "error": {"message": e.to_string()}}),
+            match security_unban_ip(&state, ip).await {
+                Ok(msg) => json!({"ok": true, "message": msg}),
+                Err(e) => json!({"ok": false, "error": {"message": e}}),
             }
         }
         "ids.stats" => {
@@ -8203,6 +8425,9 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             let ip = params["ip"].as_str().unwrap_or("").to_string();
             let list_type = params["listType"].as_str().unwrap_or("blacklist").to_string();
             if ip.is_empty() { return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 ip"}}); }
+            if let Err(e) = validate_ip_or_cidr(&ip) {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": e}});
+            }
             let mut entries = state.storage.load_ip_list();
             if entries.iter().any(|e| e.ip == ip && e.list_type == list_type) {
                 return json!({"ok": false, "error": {"code": "DUPLICATE", "message": "条目已存在"}});
@@ -8235,6 +8460,59 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 Some(e) => json!({"listed": true, "listType": e.list_type, "reason": e.reason, "expiresAt": e.expires_at}),
                 None => json!({"listed": false}),
             }
+        }
+
+        // ---- 安全中心：IP 名单管理（security.ip.*，支持 CIDR 如 192.168.1.0/24）----
+
+        "security.ip.blacklist.list" | "security.ip.whitelist.list" => {
+            let list_type = if method.contains("blacklist") { "blacklist" } else { "whitelist" };
+            let entries = state.storage.load_ip_list();
+            let filtered: Vec<_> = entries.iter().filter(|e| e.list_type == list_type).collect();
+            json!({
+                "entries": filtered.iter().map(|e| ip_entry_to_json(e)).collect::<Vec<_>>(),
+                "count": filtered.len(),
+                "listType": list_type,
+            })
+        }
+        "security.ip.blacklist.add" | "security.ip.whitelist.add" => {
+            let list_type = if method.contains("blacklist") { "blacklist" } else { "whitelist" }.to_string();
+            let ip = params["ip"].as_str().unwrap_or("").to_string();
+            if ip.is_empty() { return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 ip"}}); }
+            if let Err(e) = validate_ip_or_cidr(&ip) {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": e}});
+            }
+            let mut entries = state.storage.load_ip_list();
+            if entries.iter().any(|e| e.ip == ip && e.list_type == list_type) {
+                return json!({"ok": false, "error": {"code": "DUPLICATE", "message": "条目已存在"}});
+            }
+            entries.push(IpEntry {
+                ip: ip.clone(),
+                list_type: list_type.clone(),
+                reason: params["reason"].as_str().unwrap_or("").to_string(),
+                expires_at: params["expiresAt"].as_i64(),
+                created_at: current_ms(),
+            });
+            state.storage.save_ip_list(&entries);
+            state.storage.append_security_event(&new_security_event(
+                &format!("ip_{}", list_type), "list_add", "log", "info", &ip, "",
+                "", "IP 名单管理", &format!("添加{}条目: {}", if list_type == "blacklist" { "黑名单" } else { "白名单" }, ip),
+            ));
+            json!({"ok": true, "ip": ip, "listType": list_type})
+        }
+        "security.ip.blacklist.remove" | "security.ip.whitelist.remove" => {
+            let list_type = if method.contains("blacklist") { "blacklist" } else { "whitelist" }.to_string();
+            let ip = params["ip"].as_str().unwrap_or("").to_string();
+            if ip.is_empty() { return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 ip"}}); }
+            let mut entries = state.storage.load_ip_list();
+            let before = entries.len();
+            entries.retain(|e| !(e.ip == ip && e.list_type == list_type));
+            if entries.len() == before { return json!({"ok": false, "error": {"code": "NOT_FOUND"}}); }
+            state.storage.save_ip_list(&entries);
+            state.storage.append_security_event(&new_security_event(
+                &format!("ip_{}", list_type), "list_remove", "log", "info", &ip, "",
+                "", "IP 名单管理", &format!("移除{}条目: {}", if list_type == "blacklist" { "黑名单" } else { "白名单" }, ip),
+            ));
+            json!({"ok": true, "ip": ip, "listType": list_type})
         }
 
         // ====================================================================
@@ -8381,6 +8659,203 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             if host.is_empty() { return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 host"}}); }
             let result = tool_exposure_analysis(host).await;
             json!({"ok": true, "result": result})
+        }
+
+        // ====================================================================
+        // 安全中心（Security Center）：IDS/IPS + WAF 统一防护
+        // ====================================================================
+
+        "security.overview" => {
+            let day_start = today_start_ms();
+            let waf_rules = state.storage.load_waf_rules();
+            let ids_rules = state.storage.load_ids_rules();
+            let sec_events = state.storage.load_security_events(10000);
+            let ids_events = state.storage.load_ids_events(1000);
+            let ip_entries = state.storage.load_ip_list();
+            let bans = state.storage.load_banned_ips();
+            let rl_config = state.storage.load_rate_limit();
+            let stats = {
+                let mut s = state.security_stats.lock().await;
+                s.roll_day();
+                s.clone()
+            };
+            let now = current_ms();
+
+            // ---- WAF 聚合 ----
+            let waf_enabled = waf_rules.iter().filter(|r| r.enabled).count();
+            let waf_today: Vec<_> = sec_events.iter()
+                .filter(|e| e.category == "waf" && e.ts >= day_start).collect();
+            let waf_blocked_today = waf_today.iter().filter(|e| e.action == "block").count();
+            let mut waf_types: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for t in ["sqli", "xss", "rfi", "lfi", "cmd_inject", "traversal", "scanner"] {
+                waf_types.insert(t.to_string(), 0);
+            }
+            for e in &waf_today {
+                *waf_types.entry(e.event_type.clone()).or_insert(0) += 1;
+            }
+
+            // ---- IDS 聚合 ----
+            let ids_enabled = ids_rules.iter().filter(|r| r.enabled).count();
+            let ids_today: Vec<_> = ids_events.iter().filter(|e| e.ts >= day_start).collect();
+            let mut ids_types: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for t in ["bruteforce", "portscan", "malware", "c2"] {
+                ids_types.insert(t.to_string(), 0);
+            }
+            for e in &ids_today {
+                let norm = match e.event_type.as_str() {
+                    "ssh_bruteforce" => "bruteforce",
+                    "port_scan" => "portscan",
+                    "malware_process" => "malware",
+                    "c2_connection" => "c2",
+                    other => other,
+                };
+                *ids_types.entry(norm.to_string()).or_insert(0) += 1;
+            }
+            let active_bans: Vec<_> = bans.iter()
+                .filter(|b| b.expires_at.map(|t| t > now).unwrap_or(true)).collect();
+
+            // ---- IP 名单聚合 ----
+            let blacklist_count = ip_entries.iter().filter(|e| e.list_type == "blacklist").count();
+            let whitelist_count = ip_entries.iter().filter(|e| e.list_type == "whitelist").count();
+
+            // ---- 速率限制聚合 ----
+            let rl_today = sec_events.iter()
+                .filter(|e| e.category == "rate_limit" && e.ts >= day_start).count();
+
+            // ---- 风险评分（0-100）----
+            let mut score: u32 = 0;
+            let mut suggestions: Vec<String> = vec![];
+            if waf_enabled == 0 {
+                score += 25;
+                suggestions.push("WAF 未启用任何规则：建议启用内置 OWASP CRS 规则（security.waf.rules.toggle）".to_string());
+            }
+            if ids_enabled == 0 {
+                score += 15;
+                suggestions.push("IDS 未启用检测规则：建议启用 SSH 暴力破解/端口扫描检测".to_string());
+            }
+            if rl_config.is_empty() {
+                score += 5;
+                suggestions.push("未配置速率限制：建议 rate_limit.set 配置全局限流防 CC 攻击".to_string());
+            }
+            // 攻击量加分
+            score += (waf_blocked_today as u32).min(25);
+            let ids_critical_today = ids_today.iter().filter(|e| e.severity == "critical").count();
+            score += ((ids_critical_today as u32) * 5).min(15);
+            score += ((active_bans.len() as u32) * 2).min(10);
+            if score > 100 { score = 100; }
+            if waf_blocked_today > 50 {
+                suggestions.push(format!("今日 WAF 拦截 {} 次，攻击较多：建议启用 IDS 自动封禁（ids.scan 定时执行）", waf_blocked_today));
+            }
+            if ids_types.get("bruteforce").copied().unwrap_or(0) > 0 {
+                suggestions.push("检测到 SSH 暴力破解：建议禁用密码登录、改用密钥认证或修改 SSH 端口".to_string());
+            }
+            if blacklist_count == 0 && waf_blocked_today > 0 {
+                suggestions.push("黑名单为空但存在攻击：可将攻击源 IP 加入黑名单（security.ip.blacklist.add）".to_string());
+            }
+            if suggestions.is_empty() {
+                suggestions.push("防护状态良好，保持规则更新即可".to_string());
+            }
+            let risk_level = match score {
+                0..=20 => "low",
+                21..=50 => "medium",
+                51..=80 => "high",
+                _ => "critical",
+            };
+
+            json!({
+                "ok": true,
+                "waf": {
+                    "enabled": waf_enabled > 0,
+                    "totalRules": waf_rules.len(),
+                    "enabledRules": waf_enabled,
+                    "todayBlocked": waf_blocked_today.max(stats.waf_blocked_today as usize),
+                    "todayLogged": stats.waf_logged_today,
+                    "attackTypes": waf_types,
+                },
+                "ids": {
+                    "enabled": ids_enabled > 0,
+                    "totalRules": ids_rules.len(),
+                    "enabledRules": ids_enabled,
+                    "todayDetected": ids_today.len().max(stats.ids_detected_today as usize),
+                    "bannedCount": active_bans.len(),
+                    "attackTypes": ids_types,
+                },
+                "ip": {
+                    "blacklistCount": blacklist_count,
+                    "whitelistCount": whitelist_count,
+                    "bannedList": active_bans.iter().take(20).map(|b| ban_entry_to_json(b)).collect::<Vec<_>>(),
+                },
+                "rateLimit": {
+                    "enabled": !rl_config.is_empty(),
+                    "configCount": rl_config.len(),
+                    "todayLimited": rl_today.max(stats.rate_limited_today as usize),
+                },
+                "riskScore": score,
+                "riskLevel": risk_level,
+                "suggestions": suggestions,
+                "ts": now,
+            })
+        }
+
+        "security.check" => {
+            // 手动执行统一安全检查（与请求入口同一逻辑，便于调试）
+            let ip = params["ip"].as_str().unwrap_or("").to_string();
+            let url = params["url"].as_str().unwrap_or("/").to_string();
+            let headers = params["headers"].as_str().unwrap_or("").to_string();
+            let body = params["body"].as_str().unwrap_or("").to_string();
+            if ip.is_empty() { return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 ip"}}); }
+            match security_check_request(&state, &ip, &url, &headers, &body).await {
+                Some(block) => block,
+                None => json!({"ok": true, "blocked": false, "message": "检查通过：白名单/黑名单/限速/WAF/IDS 均未命中阻断"}),
+            }
+        }
+
+        "security.events" => {
+            // 统一安全事件流：支持按类别/类型/严重度/来源 IP/时间过滤
+            let limit = params["limit"].as_u64().unwrap_or(100) as usize;
+            let category = params["category"].as_str();
+            let event_type = params["eventType"].as_str();
+            let severity = params["severity"].as_str();
+            let source_ip = params["sourceIp"].as_str();
+            let since = params["sinceMs"].as_i64();
+            let mut events = state.storage.load_security_events(10000);
+            if let Some(c) = category { events.retain(|e| e.category == c); }
+            if let Some(t) = event_type { events.retain(|e| e.event_type == t); }
+            if let Some(s) = severity { events.retain(|e| e.severity == s); }
+            if let Some(ip) = source_ip { events.retain(|e| e.source_ip == ip); }
+            if let Some(s) = since { events.retain(|e| e.ts >= s); }
+            let total = events.len();
+            let start = total.saturating_sub(limit);
+            json!({
+                "events": events[start..].iter().rev().map(security_event_to_json).collect::<Vec<_>>(),
+                "count": total.min(limit),
+                "total": total,
+            })
+        }
+
+        "security.events.export" => {
+            // 导出统一安全事件（JSON / CSV）
+            let format = params["format"].as_str().unwrap_or("json").to_string();
+            let category = params["category"].as_str();
+            let since = params["sinceMs"].as_i64();
+            let limit = params["limit"].as_u64().unwrap_or(5000) as usize;
+            let mut events = state.storage.load_security_events(50000);
+            if let Some(c) = category { events.retain(|e| e.category == c); }
+            if let Some(s) = since { events.retain(|e| e.ts >= s); }
+            let start = events.len().saturating_sub(limit);
+            let events = events[start..].to_vec();
+            match format.as_str() {
+                "csv" => {
+                    let content = security_events_to_csv(&events);
+                    json!({"ok": true, "format": "csv", "content": content, "count": events.len()})
+                }
+                _ => {
+                    let content = serde_json::to_string_pretty(&json!(
+                        events.iter().map(security_event_to_json).collect::<Vec<_>>()
+                    )).unwrap_or_else(|_| "[]".to_string());
+                    json!({"ok": true, "format": "json", "content": content, "count": events.len()})
+                }
+            }
         }
 
         // ====================================================================
@@ -9819,6 +10294,271 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             }
         }
 
+        // ====================================================================
+        // 运维节点管理（nodes.*）：SSH 节点 CRUD + 连通性测试 + agent 注册/心跳
+        // ====================================================================
+        "nodes.list" => {
+            let nodes = state.storage.load_nodes();
+            let metrics = state.node_metrics.lock().await;
+            let now = current_ms();
+            let list: Vec<_> = nodes.iter().map(|n| ops_node_to_json(n, &metrics, now)).collect();
+            json!({"ok": true, "nodes": list, "count": list.len()})
+        }
+        "nodes.create" => {
+            let name = params["name"].as_str().unwrap_or("").trim().to_string();
+            let host = params["host"].as_str().unwrap_or("").trim().to_string();
+            if name.is_empty() || host.is_empty() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 name 或 host"}});
+            }
+            let auth_type = params["authType"].as_str().or(params["auth_type"].as_str()).unwrap_or("key").to_string();
+            if auth_type != "key" && auth_type != "password" {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "authType 必须为 key 或 password"}});
+            }
+            // 唯一 id：secure_rand_u128 前 8 字节 hex（16 个 hex 字符）
+            let id = format!("node-{}", &format!("{:032x}", secure_rand_u128())[..16]);
+            let now = current_ms();
+            let node = Node {
+                id: id.clone(),
+                name,
+                kind: "ops".to_string(),
+                status: "paired".to_string(),
+                paired_at: now,
+                last_seen: 0,
+                metadata: serde_json::Value::Null,
+                latency_ms: None, risk_score: 0, risk_reasons: vec![],
+                last_heartbeat: None, cpu_percent: None, mem_percent: None,
+                host,
+                port: params["port"].as_u64().unwrap_or(22) as u16,
+                user: params["user"].as_str().unwrap_or("root").to_string(),
+                auth_type,
+                private_key: params["privateKey"].as_str().unwrap_or("").to_string(),
+                password: params["password"].as_str().unwrap_or("").to_string(),
+                node_token: String::new(),
+            };
+            let mut nodes = state.storage.load_nodes();
+            nodes.push(node.clone());
+            state.storage.save_nodes(&nodes);
+            let metrics = state.node_metrics.lock().await;
+            json!({"ok": true, "node": ops_node_to_json(&node, &metrics, now)})
+        }
+        "nodes.update" => {
+            let id = params["id"].as_str().or(params["nodeId"].as_str()).unwrap_or("").to_string();
+            if id.is_empty() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 id"}});
+            }
+            let mut nodes = state.storage.load_nodes();
+            let n = match nodes.iter_mut().find(|n| n.id == id) {
+                Some(n) => n,
+                None => return json!({"ok": false, "error": {"code": "NOT_FOUND", "message": "节点不存在"}}),
+            };
+            if let Some(v) = params["name"].as_str() { n.name = v.to_string(); }
+            if let Some(v) = params["host"].as_str() { n.host = v.to_string(); }
+            if let Some(v) = params["port"].as_u64() { n.port = v as u16; }
+            if let Some(v) = params["user"].as_str() { n.user = v.to_string(); }
+            if let Some(v) = params["authType"].as_str().or(params["auth_type"].as_str()) {
+                if v != "key" && v != "password" {
+                    return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "authType 必须为 key 或 password"}});
+                }
+                n.auth_type = v.to_string();
+            }
+            if let Some(v) = params["privateKey"].as_str() { n.private_key = v.to_string(); }
+            if let Some(v) = params["password"].as_str() { n.password = v.to_string(); }
+            let updated = n.clone();
+            state.storage.save_nodes(&nodes);
+            let metrics = state.node_metrics.lock().await;
+            json!({"ok": true, "node": ops_node_to_json(&updated, &metrics, current_ms())})
+        }
+        "nodes.delete" => {
+            let id = params["id"].as_str().or(params["nodeId"].as_str()).unwrap_or("").to_string();
+            if id.is_empty() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 id"}});
+            }
+            let mut nodes = state.storage.load_nodes();
+            let before = nodes.len();
+            nodes.retain(|n| n.id != id);
+            state.storage.save_nodes(&nodes);
+            state.node_metrics.lock().await.remove(&id);
+            json!({"ok": true, "removed": before - nodes.len(), "id": id})
+        }
+        "nodes.test" => {
+            // 连通性测试：TCP 连接 host:port（超时 5s）+ 读取 SSH banner 尝试握手（超时 3s）
+            // 不依赖 ssh 库，用 tokio::net::TcpStream
+            let (host, port) = {
+                let id = params["id"].as_str().or(params["nodeId"].as_str()).unwrap_or("");
+                if !id.is_empty() {
+                    let nodes = state.storage.load_nodes();
+                    match nodes.iter().find(|n| n.id == id) {
+                        Some(n) => (n.host.clone(), n.port),
+                        None => return json!({"ok": false, "error": {"code": "NOT_FOUND", "message": "节点不存在"}}),
+                    }
+                } else {
+                    let h = params["host"].as_str().unwrap_or("").to_string();
+                    let p = params["port"].as_u64().unwrap_or(22) as u16;
+                    (h, p)
+                }
+            };
+            if host.is_empty() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 host"}});
+            }
+            let addr = format!("{}:{}", host, port);
+            let started = std::time::Instant::now();
+            match tokio::time::timeout(std::time::Duration::from_secs(5), tokio::net::TcpStream::connect(&addr)).await {
+                Ok(Ok(mut stream)) => {
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    // SSH 握手尝试：SSH 服务端连接建立后会主动发送 banner（"SSH-2.0-..."）
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = vec![0u8; 256];
+                    let banner = match tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf)).await {
+                        Ok(Ok(n)) if n > 0 => String::from_utf8_lossy(&buf[..n]).trim().to_string(),
+                        _ => String::new(),
+                    };
+                    let ssh_ok = banner.starts_with("SSH-");
+                    json!({
+                        "ok": true, "reachable": true, "ssh": ssh_ok, "banner": banner,
+                        "latencyMs": latency_ms, "host": host, "port": port,
+                    })
+                }
+                Ok(Err(e)) => json!({"ok": false, "reachable": false, "host": host, "port": port,
+                    "error": {"code": "CONNECT_FAILED", "message": format!("TCP 连接失败: {}", e)}}),
+                Err(_) => json!({"ok": false, "reachable": false, "host": host, "port": port,
+                    "error": {"code": "TIMEOUT", "message": "连接超时（5s）"}}),
+            }
+        }
+        "nodes.generate_agent_code" => {
+            // 为指定节点（或新节点名）生成一键安装代码
+            // 一次性注册 token（10 分钟有效），安装脚本内嵌 token + 网关地址
+            let id = params["id"].as_str().or(params["nodeId"].as_str()).unwrap_or("").to_string();
+            let name = if !id.is_empty() {
+                let nodes = state.storage.load_nodes();
+                match nodes.iter().find(|n| n.id == id) {
+                    Some(n) => n.name.clone(),
+                    None => return json!({"ok": false, "error": {"code": "NOT_FOUND", "message": "节点不存在"}}),
+                }
+            } else {
+                params["name"].as_str().unwrap_or("agent-node").to_string()
+            };
+            let token = format!("{:032x}", secure_rand_u128());
+            let expires_at = current_ms() + 10 * 60 * 1000;
+            {
+                let mut pending = state.nodes_pending.lock().await;
+                // 顺手清理已过期的注册 token
+                pending.retain(|_, (_, exp)| *exp > current_ms());
+                pending.insert(token.clone(), (name.clone(), expires_at));
+            }
+            let gateway = params["gateway"].as_str().map(|s| s.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| {
+                    let host = if state.config.bind_host == "0.0.0.0" { "127.0.0.1" } else { state.config.bind_host.as_str() };
+                    format!("http://{}:{}", host, state.config.port)
+                });
+            let script = build_agent_install_script(&gateway, &token, &name);
+            let b64 = base64_encode_bytes(script.as_bytes());
+            json!({
+                "ok": true,
+                "token": token,
+                "expiresAt": expires_at,
+                "gateway": gateway,
+                "script": script,
+                "code": format!("echo '{}' | base64 -d | bash", b64),
+            })
+        }
+        "nodes.register" => {
+            // agent 安装脚本回调：一次性 token 验证 -> 创建节点 -> 分配 node_token
+            let token = params["token"].as_str().unwrap_or("").to_string();
+            if token.is_empty() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 token"}});
+            }
+            // 取出即作废（一次性使用）
+            let entry = state.nodes_pending.lock().await.remove(&token);
+            let (name, _expires) = match entry {
+                Some(e) if e.1 > current_ms() => e,
+                Some(_) => return json!({"ok": false, "error": {"code": "TOKEN_EXPIRED", "message": "注册 token 已过期（10 分钟有效）"}}),
+                None => return json!({"ok": false, "error": {"code": "INVALID_TOKEN", "message": "注册 token 无效或已被使用"}}),
+            };
+            // host = 回调来源 IP（agent 安装脚本自动检测上报）
+            let host = params["host"].as_str().or(params["ip"].as_str()).unwrap_or("").to_string();
+            let node_token = format!("{:032x}", secure_rand_u128());
+            let id = format!("node-{}", &format!("{:032x}", secure_rand_u128())[..16]);
+            let now = current_ms();
+            let node = Node {
+                id: id.clone(),
+                name,
+                kind: "ops".to_string(),
+                status: "paired".to_string(),
+                paired_at: now,
+                last_seen: now,
+                metadata: json!({"source": "agent-register"}),
+                latency_ms: None, risk_score: 0, risk_reasons: vec![],
+                last_heartbeat: Some(now), cpu_percent: None, mem_percent: None,
+                host,
+                port: 22,
+                user: "agent".to_string(),
+                auth_type: "key".to_string(),
+                private_key: String::new(),
+                password: String::new(),
+                node_token: node_token.clone(),
+            };
+            let mut nodes = state.storage.load_nodes();
+            nodes.push(node);
+            state.storage.save_nodes(&nodes);
+            // 返回 agent 后续配置（心跳间隔 + 上报地址）
+            json!({
+                "ok": true,
+                "nodeId": id,
+                "nodeToken": node_token,
+                "config": {
+                    "heartbeatIntervalSecs": 30,
+                    "reportUrl": "/api/agent/rpc",
+                }
+            })
+        }
+        "nodes.heartbeat" => {
+            // agent 每 30s 上报：node_token 校验 -> 更新心跳时间 -> 存最新 metrics
+            let id = params["nodeId"].as_str().or(params["id"].as_str()).unwrap_or("").to_string();
+            let token = params["nodeToken"].as_str().or(params["node_token"].as_str()).unwrap_or("").to_string();
+            if id.is_empty() || token.is_empty() {
+                return json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 nodeId 或 nodeToken"}});
+            }
+            let mut nodes = state.storage.load_nodes();
+            let n = match nodes.iter_mut().find(|n| n.id == id) {
+                Some(n) => n,
+                None => return json!({"ok": false, "error": {"code": "NOT_FOUND", "message": "节点不存在"}}),
+            };
+            // node_token 校验（注册后分配，恒量时间比较防时序侧信道）
+            if n.node_token.is_empty() || !constant_time_eq(token.as_bytes(), n.node_token.as_bytes()) {
+                return json!({"ok": false, "error": {"code": "UNAUTHORIZED", "message": "nodeToken 无效"}});
+            }
+            let now = current_ms();
+            // metrics：优先取 agent 上报值；缺省时本地从 /proc 采样（复用 host.stats 的函数）
+            let metrics = if params["metrics"].is_object() {
+                params["metrics"].clone()
+            } else {
+                let cpu = sample_cpu_usage().await;
+                let (mem_total, mem_used, _mem_avail) = read_meminfo();
+                let mem_pct = if mem_total > 0 {
+                    (mem_used as f64 / mem_total as f64 * 1000.0).round() / 10.0
+                } else { 0.0 };
+                let disks = read_disk_usage().await;
+                let (rx_kbps, tx_kbps) = sample_net_io().await;
+                let (l1, l5, l15) = std::fs::read_to_string("/proc/loadavg").ok()
+                    .and_then(|s| {
+                        let p: Vec<&str> = s.split_whitespace().collect();
+                        if p.len() >= 3 {
+                            Some((p[0].parse().unwrap_or(0.0), p[1].parse().unwrap_or(0.0), p[2].parse().unwrap_or(0.0)))
+                        } else { None }
+                    })
+                    .unwrap_or((0.0, 0.0, 0.0));
+                json!({"cpu": cpu, "mem": mem_pct, "disks": disks, "load": [l1, l5, l15],
+                       "net": {"rxKbps": rx_kbps, "txKbps": tx_kbps}})
+            };
+            if let Some(c) = metrics["cpu"].as_f64() { n.cpu_percent = Some(c.round() as u32); }
+            if let Some(m) = metrics["mem"].as_f64() { n.mem_percent = Some(m.round() as u32); }
+            n.last_seen = now;
+            n.last_heartbeat = Some(now);
+            state.storage.save_nodes(&nodes);
+            state.node_metrics.lock().await.insert(id.clone(), metrics);
+            json!({"ok": true, "nodeId": id, "ts": now, "nextHeartbeatSecs": 30})
+        }
+
         _ => {
             // 通用回退：返回 ok 让 UI 继续
             json!({ "ok": true })
@@ -9870,6 +10610,282 @@ fn node_to_json(n: &Node) -> serde_json::Value {
         "lastSeen": n.last_seen,
         "metadata": n.metadata
     })
+}
+
+/// 运维节点序列化（nodes.* RPC 用）：含 SSH 配置与在线状态，绝不外泄私钥/密码/node_token
+fn ops_node_to_json(n: &Node, metrics: &HashMap<String, serde_json::Value>, now: i64) -> serde_json::Value {
+    // 90 秒无心跳 → offline（未注册 agent 的节点无心跳，视为 offline）
+    let online = n.last_heartbeat.map(|hb| now - hb < 90_000).unwrap_or(false);
+    json!({
+        "id": n.id,
+        "name": n.name,
+        "kind": n.kind,
+        "status": if online { "online" } else { "offline" },
+        "pairStatus": n.status,
+        "host": n.host,
+        "port": n.port,
+        "user": n.user,
+        "authType": n.auth_type,
+        "hasPrivateKey": !n.private_key.is_empty(),
+        "hasPassword": !n.password.is_empty(),
+        "registered": !n.node_token.is_empty(),
+        "online": online,
+        "pairedAt": n.paired_at,
+        "lastSeen": n.last_seen,
+        "lastHeartbeat": n.last_heartbeat,
+        "cpuPercent": n.cpu_percent,
+        "memPercent": n.mem_percent,
+        "latencyMs": n.latency_ms,
+        "metrics": metrics.get(&n.id).cloned().unwrap_or(serde_json::Value::Null),
+        "metadata": n.metadata,
+    })
+}
+
+/// 生成 agent 一键安装脚本（完整可执行：检测 OS → 装依赖 → 下载 agent → 注册 → 启动心跳）
+/// 返回的脚本经 base64 编码后用户复制到目标机器执行。
+fn build_agent_install_script(gateway: &str, token: &str, node_name: &str) -> String {
+    let tpl = r#"#!/usr/bin/env bash
+# ============================================================================
+# CradleRing Agent 一键安装脚本
+# 节点: __NODE_NAME__
+# 网关: __GATEWAY__
+# 步骤: 检测系统 -> 安装 curl/jq -> 下载 agent -> 注册到网关 -> 启动心跳服务
+# ============================================================================
+set -e
+
+GATEWAY="__GATEWAY__"
+REG_TOKEN="__TOKEN__"
+NODE_NAME="__NODE_NAME__"
+
+SUDO=""
+if [ "$(id -u)" != "0" ]; then SUDO="sudo"; fi
+
+echo "[1/5] 检测系统包管理器 ..."
+PKG=""
+if command -v apt-get >/dev/null 2>&1; then PKG="apt"
+elif command -v dnf >/dev/null 2>&1; then PKG="dnf"
+elif command -v yum >/dev/null 2>&1; then PKG="yum"
+elif command -v apk >/dev/null 2>&1; then PKG="apk"
+fi
+echo "      包管理器: ${PKG:-未知}"
+
+echo "[2/5] 安装依赖 curl/jq ..."
+case "$PKG" in
+  apt) $SUDO apt-get update -y >/dev/null && $SUDO apt-get install -y curl jq ;;
+  dnf) $SUDO dnf install -y curl jq ;;
+  yum) $SUDO yum install -y curl jq ;;
+  apk) $SUDO apk add --no-cache curl jq ;;
+  *)   echo "      警告: 未识别的包管理器，请自行确保 curl/jq 已安装" ;;
+esac
+
+echo "[3/5] 从网关下载 agent ..."
+AGENT_OK=0
+if curl -fsSL -m 120 "$GATEWAY/api/agent/download" -o /tmp/cradle-ring-agent; then
+  chmod +x /tmp/cradle-ring-agent
+  if $SUDO mv /tmp/cradle-ring-agent /usr/local/bin/cradle-ring; then
+    AGENT_OK=1
+    echo "      agent 已安装: /usr/local/bin/cradle-ring"
+    # 若 agent 支持 install 子命令则执行其内置安装逻辑（best-effort）
+    /usr/local/bin/cradle-ring agent install 2>/dev/null || true
+  fi
+fi
+if [ "$AGENT_OK" != "1" ]; then
+  echo "      警告: agent 二进制下载失败，将使用内置 shell 心跳循环"
+fi
+
+echo "[4/5] 注册到网关 ..."
+# 自动检测本机出口 IP（作为回调来源地址）
+HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+if [ -z "$HOST_IP" ]; then
+  HOST_IP=$(ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | grep -v '^127\.' | head -1)
+fi
+[ -z "$HOST_IP" ] && HOST_IP="127.0.0.1"
+
+REG_RESP=$(curl -fsS -m 15 -X POST "$GATEWAY/api/agent/rpc" \
+  -H 'Content-Type: application/json' \
+  -d "{\"method\":\"nodes.register\",\"params\":{\"token\":\"$REG_TOKEN\",\"host\":\"$HOST_IP\",\"name\":\"$NODE_NAME\"}}" 2>&1) || {
+  echo "      注册请求失败: $REG_RESP"; exit 1;
+}
+
+NODE_ID=$(echo "$REG_RESP" | jq -r '.payload.nodeId // empty')
+NODE_TOKEN=$(echo "$REG_RESP" | jq -r '.payload.nodeToken // empty')
+HB_INTERVAL=$(echo "$REG_RESP" | jq -r '.payload.config.heartbeatIntervalSecs // 30')
+
+if [ -z "$NODE_ID" ] || [ -z "$NODE_TOKEN" ]; then
+  echo "      注册失败: $REG_RESP"
+  exit 1
+fi
+echo "      注册成功: nodeId=$NODE_ID (心跳间隔 ${HB_INTERVAL}s)"
+
+echo "[5/5] 配置并启动心跳服务 ..."
+# 写入 agent 配置（cradle-ring agent run 与 shell 心跳脚本共用）
+$SUDO mkdir -p /etc/cradle-ring
+cat > /tmp/cradle-ring-agent.conf <<EOF
+GATEWAY=$GATEWAY
+NODE_ID=$NODE_ID
+NODE_TOKEN=$NODE_TOKEN
+HEARTBEAT_INTERVAL=$HB_INTERVAL
+EOF
+$SUDO mv /tmp/cradle-ring-agent.conf /etc/cradle-ring/agent.conf
+$SUDO chmod 600 /etc/cradle-ring/agent.conf
+
+# shell 心跳兜底脚本（agent 二进制不可用时使用；每 30s 从 /proc 采样上报）
+cat > /tmp/cradle-ring-heartbeat.sh <<'HEARTBEAT_EOF'
+#!/usr/bin/env bash
+. /etc/cradle-ring/agent.conf
+net_stats() {
+  awk '{gsub(/^[ \t]+/,"")} /:/{split($0,a,":"); if(a[1]!="lo"){split(a[2],b," "); rx+=b[1]; tx+=b[9]}}END{print rx+0, tx+0}' /proc/net/dev
+}
+while true; do
+  # CPU：/proc/stat 两次采样（间隔 1s）
+  read -r _ u1 n1 s1 i1 w1 _ _ _ _ < /proc/stat; t1=$((u1+n1+s1+i1+w1)); d1=$((i1+w1))
+  read rx1 tx1 <<< "$(net_stats)"
+  sleep 1
+  read -r _ u2 n2 s2 i2 w2 _ _ _ _ < /proc/stat; t2=$((u2+n2+s2+i2+w2)); d2=$((i2+w2))
+  read rx2 tx2 <<< "$(net_stats)"
+  dt=$((t2-t1)); dd=$((d2-d1)); cpu="0"
+  [ "$dt" -gt 0 ] && cpu=$(awk -v dt="$dt" -v dd="$dd" 'BEGIN{printf "%.1f",(dt-dd)/dt*100}')
+  # 内存：/proc/meminfo
+  mem=$(awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{if(t>0)printf "%.1f",(t-a)/t*100; else print 0}' /proc/meminfo)
+  # 磁盘（根分区使用率 %）
+  disk=$(df -P / | awk 'NR==2{gsub(/%/,"",$5); print $5+0}')
+  # 负载：/proc/loadavg
+  read -r l1 l5 l15 _ < /proc/loadavg
+  # 网络速率（KB/s，1s 采样）
+  rx_kbps=$(( (rx2-rx1)/1024 )); tx_kbps=$(( (tx2-tx1)/1024 ))
+  payload=$(jq -n \
+    --arg id "$NODE_ID" --arg tok "$NODE_TOKEN" \
+    --argjson cpu "${cpu:-0}" --argjson mem "${mem:-0}" --argjson disk "${disk:-0}" \
+    --argjson l1 "${l1:-0}" --argjson l5 "${l5:-0}" --argjson l15 "${l15:-0}" \
+    --argjson rx "${rx_kbps:-0}" --argjson tx "${tx_kbps:-0}" \
+    '{method:"nodes.heartbeat",params:{nodeId:$id,nodeToken:$tok,metrics:{cpu:$cpu,mem:$mem,disk:$disk,load:[$l1,$l5,$l15],net:{rxKbps:$rx,txKbps:$tx}}}}')
+  curl -fsS -m 10 -X POST "$GATEWAY/api/agent/rpc" -H 'Content-Type: application/json' \
+    -d "$payload" >/dev/null 2>&1 || true
+  sleep "${HEARTBEAT_INTERVAL:-30}"
+done
+HEARTBEAT_EOF
+chmod +x /tmp/cradle-ring-heartbeat.sh
+$SUDO mv /tmp/cradle-ring-heartbeat.sh /usr/local/bin/cradle-ring-heartbeat.sh
+
+# systemd 服务：优先 cradle-ring agent run，兜底 shell 心跳脚本
+if command -v systemctl >/dev/null 2>&1 && [ -d /etc/systemd/system ]; then
+  if [ "$AGENT_OK" = "1" ]; then
+    EXEC_START="/usr/local/bin/cradle-ring agent run"
+  else
+    EXEC_START="/usr/local/bin/cradle-ring-heartbeat.sh"
+  fi
+  cat > /tmp/cradle-ring-agent.service <<EOF
+[Unit]
+Description=CradleRing Node Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$EXEC_START
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  $SUDO mv /tmp/cradle-ring-agent.service /etc/systemd/system/cradle-ring-agent.service
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl enable --now cradle-ring-agent
+  echo "      systemd 服务已启动: cradle-ring-agent"
+else
+  # 无 systemd（容器/最小系统）：后台 nohup 运行
+  if [ "$AGENT_OK" = "1" ]; then
+    nohup /usr/local/bin/cradle-ring agent run >/var/log/cradle-ring-agent.log 2>&1 &
+  else
+    nohup /usr/local/bin/cradle-ring-heartbeat.sh >/var/log/cradle-ring-agent.log 2>&1 &
+  fi
+  echo "      心跳进程已后台启动（nohup, 日志: /var/log/cradle-ring-agent.log）"
+fi
+
+echo ""
+echo "安装完成! 节点 $NODE_NAME ($HOST_IP) 已接入 CradleRing 网关。"
+"#;
+    tpl.replace("__GATEWAY__", gateway)
+        .replace("__TOKEN__", token)
+        .replace("__NODE_NAME__", node_name)
+}
+
+/// 节点 agent 心跳循环（cradle-ring agent run）：
+/// 每 interval 秒从 /proc 采样（复用 host.stats 的函数）并 POST nodes.heartbeat 到网关。
+async fn agent_heartbeat_loop(gateway: String, node_id: String, node_token: String, interval_secs: u64) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let url = format!("{}/api/agent/rpc", gateway.trim_end_matches('/'));
+    println!("CradleRing agent 已启动: nodeId={} 网关={} 心跳间隔={}s", node_id, gateway, interval_secs);
+    loop {
+        // CPU（/proc/stat 采样）
+        let cpu = sample_cpu_usage().await;
+        // 内存（/proc/meminfo）
+        let (mem_total, mem_used, _mem_avail) = read_meminfo();
+        let mem_pct = if mem_total > 0 {
+            (mem_used as f64 / mem_total as f64 * 1000.0).round() / 10.0
+        } else { 0.0 };
+        // 磁盘（df）
+        let disks = read_disk_usage().await;
+        let root_pct = disks.iter()
+            .find(|d| d["mount"].as_str() == Some("/"))
+            .and_then(|d| d["usagePct"].as_f64())
+            .unwrap_or(0.0);
+        // 负载（/proc/loadavg）
+        let (l1, l5, l15) = std::fs::read_to_string("/proc/loadavg").ok()
+            .and_then(|s| {
+                let p: Vec<&str> = s.split_whitespace().collect();
+                if p.len() >= 3 {
+                    Some((p[0].parse().unwrap_or(0.0), p[1].parse().unwrap_or(0.0), p[2].parse().unwrap_or(0.0)))
+                } else { None }
+            })
+            .unwrap_or((0.0, 0.0, 0.0));
+        // 网络 IO（/proc/net/dev 采样）
+        let (rx_kbps, tx_kbps) = sample_net_io().await;
+
+        let payload = json!({
+            "method": "nodes.heartbeat",
+            "params": {
+                "nodeId": node_id,
+                "nodeToken": node_token,
+                "metrics": {
+                    "cpu": cpu,
+                    "mem": mem_pct,
+                    "disk": root_pct,
+                    "disks": disks,
+                    "load": [l1, l5, l15],
+                    "net": { "rxKbps": rx_kbps, "txKbps": tx_kbps },
+                }
+            }
+        });
+        match client.post(&url).json(&payload).send().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    eprintln!("心跳上报失败: HTTP {}", resp.status());
+                }
+            }
+            Err(e) => eprintln!("心跳上报失败: {}", e),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+    }
+}
+
+/// 读取 agent 配置文件（/etc/cradle-ring/agent.conf，KEY=VALUE 格式）
+fn load_agent_conf(path: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Ok(data) = std::fs::read_to_string(path) {
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') { continue; }
+            if let Some(idx) = line.find('=') {
+                map.insert(line[..idx].trim().to_string(), line[idx + 1..].trim().to_string());
+            }
+        }
+    }
+    map
 }
 
 fn pair_request_to_json(r: &PairRequest) -> serde_json::Value {
@@ -14318,11 +15334,11 @@ struct RateLimitEntry {
     action: String,
 }
 
-/// IP 黑白名单检查
+/// IP 黑白名单检查（CIDR 感知：支持 192.168.1.0/24 与 * 通配）
 fn check_ip_list<'a>(entries: &'a [IpEntry], ip: &str) -> Option<&'a IpEntry> {
     let now = current_ms();
     entries.iter().find(|e| {
-        e.ip == ip && (e.expires_at.map(|t| t > now).unwrap_or(true))
+        ip_matches_pattern(&e.ip, ip) && (e.expires_at.map(|t| t > now).unwrap_or(true))
     })
 }
 
@@ -14693,6 +15709,451 @@ fn ids_rule_to_json(r: &IdsRule) -> serde_json::Value {
         "enabled": r.enabled, "description": r.description, "hitCount": r.hit_count,
         "createdAt": r.created_at,
     })
+}
+
+// ============================================================================
+// 安全中心（Security Center）：统一安全事件 + 封禁持久化 + 实时阻断
+// ============================================================================
+
+/// 统一安全事件（WAF / IDS / IP 名单 / 速率限制 全量记录，JSONL 持久化）
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct SecurityEvent {
+    id: String,
+    /// 事件类别：waf / ids / ip_blacklist / ip_whitelist / rate_limit
+    category: String,
+    /// 事件类型：sqli/xss/...（WAF 规则类型）或 ssh_bruteforce/port_scan/ban/unban 等
+    event_type: String,
+    /// 动作：block / log / allow / ban / unban
+    action: String,
+    /// 严重等级：critical / high / medium / low / info
+    severity: String,
+    /// 来源 IP
+    source_ip: String,
+    /// 目标（URL 或描述）
+    target: String,
+    /// 命中规则 ID（可为空）
+    rule_id: String,
+    /// 命中规则名（可为空）
+    rule_name: String,
+    /// 详情
+    detail: String,
+    ts: i64,
+}
+
+/// 封禁记录（持久化到 banned_ips.json，与 iptables 规则对应）
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct BanEntry {
+    ip: String,
+    #[serde(default)]
+    reason: String,
+    /// 封禁截止时间戳 ms（None = 永久）
+    #[serde(default)]
+    expires_at: Option<i64>,
+    created_at: i64,
+}
+
+/// 安全中心运行时统计（内存计数，跨日自动清零）
+#[derive(Clone, Debug)]
+struct SecurityStats {
+    /// 当日 WAF 阻断数
+    waf_blocked_today: u64,
+    /// 当日 WAF 仅记录（log 动作）数
+    waf_logged_today: u64,
+    /// 当日 IDS 检测数
+    ids_detected_today: u64,
+    /// 当日速率限制拦截数
+    rate_limited_today: u64,
+    /// 当日黑名单阻断数
+    blacklist_blocked_today: u64,
+    /// 统计周期起点（当日 0 点 ms）
+    day_start: i64,
+    /// 速率限制内存计数器：scope:target -> (count, window_start_ms)
+    rate_counters: HashMap<String, (u32, i64)>,
+    /// 单 IP 请求行为计数器（IDS 行为分析用）：ip -> (count, window_start_ms)
+    req_counters: HashMap<String, (u32, i64)>,
+}
+
+impl SecurityStats {
+    fn new() -> Self {
+        SecurityStats {
+            waf_blocked_today: 0,
+            waf_logged_today: 0,
+            ids_detected_today: 0,
+            rate_limited_today: 0,
+            blacklist_blocked_today: 0,
+            day_start: today_start_ms(),
+            rate_counters: HashMap::new(),
+            req_counters: HashMap::new(),
+        }
+    }
+    /// 跨天则清零当日计数
+    fn roll_day(&mut self) {
+        let ds = today_start_ms();
+        if ds != self.day_start {
+            self.day_start = ds;
+            self.waf_blocked_today = 0;
+            self.waf_logged_today = 0;
+            self.ids_detected_today = 0;
+            self.rate_limited_today = 0;
+            self.blacklist_blocked_today = 0;
+        }
+    }
+}
+
+/// 当日 0 点的时间戳（ms，本地时区）
+fn today_start_ms() -> i64 {
+    let now = chrono::Local::now();
+    now.date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|t| t.and_local_timezone(chrono::Local).single())
+        .map(|d| d.timestamp_millis())
+        .unwrap_or_else(|| current_ms() - 86_400_000)
+}
+
+/// 安全事件序列化
+fn security_event_to_json(e: &SecurityEvent) -> serde_json::Value {
+    json!({
+        "id": e.id, "category": e.category, "eventType": e.event_type,
+        "action": e.action, "severity": e.severity, "sourceIp": e.source_ip,
+        "target": e.target, "ruleId": e.rule_id, "ruleName": e.rule_name,
+        "detail": e.detail, "ts": e.ts,
+    })
+}
+
+/// 封禁记录序列化
+fn ban_entry_to_json(b: &BanEntry) -> serde_json::Value {
+    json!({
+        "ip": b.ip, "reason": b.reason, "expiresAt": b.expires_at, "createdAt": b.created_at,
+    })
+}
+
+/// 构造一条统一安全事件
+fn new_security_event(category: &str, event_type: &str, action: &str, severity: &str,
+                      source_ip: &str, target: &str, rule_id: &str, rule_name: &str, detail: &str) -> SecurityEvent {
+    SecurityEvent {
+        id: format!("sec-ev-{:016x}", rand_u128()),
+        category: category.to_string(),
+        event_type: event_type.to_string(),
+        action: action.to_string(),
+        severity: severity.to_string(),
+        source_ip: source_ip.to_string(),
+        target: target.chars().take(300).collect(),
+        rule_id: rule_id.to_string(),
+        rule_name: rule_name.to_string(),
+        detail: detail.chars().take(500).collect(),
+        ts: current_ms(),
+    }
+}
+
+/// 校验 IP 或 CIDR（如 192.168.1.0/24），支持 * 通配
+fn validate_ip_or_cidr(s: &str) -> Result<(), String> {
+    if s == "*" { return Ok(()); }
+    if let Some((ip, prefix)) = s.split_once('/') {
+        ip.parse::<std::net::IpAddr>().map_err(|_| format!("非法 IP 地址: {}", ip))?;
+        let p: u32 = prefix.parse().map_err(|_| format!("非法 CIDR 前缀: {}", prefix))?;
+        let max = if ip.contains(':') { 128 } else { 32 };
+        if p > max { return Err(format!("CIDR 前缀超出范围: /{}（最大 /{}）", p, max)); }
+        Ok(())
+    } else {
+        validate_ip_str(s)
+    }
+}
+
+/// 判断 IP 是否匹配名单模式（支持单 IP、CIDR、* 通配）
+fn ip_matches_pattern(pattern: &str, ip: &str) -> bool {
+    if pattern == "*" { return true; }
+    if let Some((net, prefix)) = pattern.split_once('/') {
+        // IPv4 CIDR 匹配
+        if let (Ok(n), Ok(i), Ok(p)) = (
+            net.parse::<std::net::Ipv4Addr>(),
+            ip.parse::<std::net::Ipv4Addr>(),
+            prefix.parse::<u32>(),
+        ) {
+            if p <= 32 {
+                let mask: u32 = if p == 0 { 0 } else { u32::MAX << (32 - p) };
+                return (u32::from(n) & mask) == (u32::from(i) & mask);
+            }
+        }
+        false
+    } else {
+        pattern == ip
+    }
+}
+
+/// 按名单类型检查 IP（CIDR 感知）
+fn check_ip_list_typed<'a>(entries: &'a [IpEntry], ip: &str, list_type: &str) -> Option<&'a IpEntry> {
+    let now = current_ms();
+    entries.iter().find(|e| {
+        e.list_type == list_type
+            && ip_matches_pattern(&e.ip, ip)
+            && (e.expires_at.map(|t| t > now).unwrap_or(true))
+    })
+}
+
+/// 统一封禁：iptables 封禁 + 持久化 + 事件记录 + 统计
+async fn security_ban_ip(state: &Arc<AppState>, ip: &str, duration_secs: u64, reason: &str) -> Result<String, String> {
+    validate_ip_str(ip)?;
+    let msg = ids_ban_ip(ip, duration_secs).await?;
+    // 持久化封禁记录
+    let mut bans = state.storage.load_banned_ips();
+    bans.retain(|b| b.ip != ip);
+    bans.push(BanEntry {
+        ip: ip.to_string(),
+        reason: reason.to_string(),
+        expires_at: if duration_secs > 0 { Some(current_ms() + duration_secs as i64 * 1000) } else { None },
+        created_at: current_ms(),
+    });
+    state.storage.save_banned_ips(&bans);
+    // 统一安全事件
+    state.storage.append_security_event(&new_security_event(
+        "ids", "ban", "ban", "high", ip, "", "", "手动/自动封禁",
+        &format!("{} (原因: {})", msg, reason),
+    ));
+    // 运行时统计
+    let mut stats = state.security_stats.lock().await;
+    stats.roll_day();
+    stats.ids_detected_today += 1;
+    Ok(msg)
+}
+
+/// 统一解封：iptables 删除 + 持久化移除 + 事件记录
+async fn security_unban_ip(state: &Arc<AppState>, ip: &str) -> Result<String, String> {
+    validate_ip_str(ip)?;
+    let result = tokio::process::Command::new("iptables")
+        .args(["-D", "INPUT", "-s", ip, "-j", "DROP"])
+        .output().await;
+    let msg = match result {
+        Ok(o) if o.status.success() => format!("IP {} 已解封", ip),
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).to_string();
+            // iptables 规则可能已不存在（已解封过/从未封禁），仍清理本地记录
+            format!("IP {} 已解封（iptables: {}）", ip, if err.trim().is_empty() { "ok" } else { err.trim() })
+        }
+        Err(e) => return Err(format!("执行失败: {}", e)),
+    };
+    let mut bans = state.storage.load_banned_ips();
+    bans.retain(|b| b.ip != ip);
+    state.storage.save_banned_ips(&bans);
+    state.storage.append_security_event(&new_security_event(
+        "ids", "unban", "unban", "info", ip, "", "", "解封", &msg,
+    ));
+    Ok(msg)
+}
+
+/// 统一安全检查入口（实时阻断核心）：
+/// 白名单放行 → 黑名单阻断 → IDS 封禁阻断 → 速率限制 → WAF 规则 → IDS 行为分析
+/// 返回 Some(json) 表示请求被阻断（含命中规则名/原因），None 表示放行
+async fn security_check_request(
+    state: &Arc<AppState>,
+    source_ip: &str,
+    url: &str,
+    headers: &str,
+    body: &str,
+) -> Option<serde_json::Value> {
+    let now = current_ms();
+    let is_local = source_ip == "127.0.0.1" || source_ip == "::1" || source_ip.eq_ignore_ascii_case("localhost");
+    let ip_entries = state.storage.load_ip_list();
+
+    // 1. 白名单放行（命中即放行，不再走后续检查）
+    if let Some(e) = check_ip_list_typed(&ip_entries, source_ip, "whitelist") {
+        if !is_local {
+            state.storage.append_security_event(&new_security_event(
+                "ip_whitelist", "whitelist_pass", "allow", "info", source_ip, url,
+                "", "IP 白名单", &format!("白名单放行: {}", e.reason),
+            ));
+        }
+        return None;
+    }
+
+    // 2. 黑名单阻断
+    if let Some(e) = check_ip_list_typed(&ip_entries, source_ip, "blacklist") {
+        {
+            let mut stats = state.security_stats.lock().await;
+            stats.roll_day();
+            stats.blacklist_blocked_today += 1;
+        }
+        state.storage.append_security_event(&new_security_event(
+            "ip_blacklist", "blacklist_block", "block", "high", source_ip, url,
+            "", "IP 黑名单", &format!("黑名单阻断: {}", e.reason),
+        ));
+        return Some(json!({
+            "ok": false, "blocked": true, "stage": "ip_blacklist",
+            "error": {"code": "SEC_BLACKLISTED", "message": format!("IP {} 在黑名单中: {}", source_ip, e.reason)},
+        }));
+    }
+
+    // 2b. IDS 封禁列表阻断（手动/自动封禁的 IP）
+    let bans = state.storage.load_banned_ips();
+    if let Some(b) = bans.iter().find(|b| ip_matches_pattern(&b.ip, source_ip)
+        && b.expires_at.map(|t| t > now).unwrap_or(true)) {
+        state.storage.append_security_event(&new_security_event(
+            "ids", "banned_ip_block", "block", "high", source_ip, url,
+            "", "IDS 封禁", &format!("封禁 IP 访问被阻断: {}", b.reason),
+        ));
+        return Some(json!({
+            "ok": false, "blocked": true, "stage": "ids_ban",
+            "error": {"code": "SEC_BANNED", "message": format!("IP {} 已被封禁: {}", source_ip, b.reason)},
+        }));
+    }
+
+    // 3. 速率限制（内存计数器，命中配置才生效）
+    let rl_config = state.storage.load_rate_limit();
+    let rl_cfg = rl_config.iter().find(|e| e.scope == "global"
+        || (e.scope == "ip" && (e.target == source_ip || e.target == "*"))).cloned();
+    if let Some(c) = rl_cfg {
+        let key = format!("{}:{}", c.scope, c.target);
+        let mut exceeded = false;
+        {
+            let mut stats = state.security_stats.lock().await;
+            stats.roll_day();
+            let window_ms = (c.window_secs as i64) * 1000;
+            let entry = stats.rate_counters.entry(key).or_insert((0, now));
+            if now - entry.1 > window_ms { *entry = (0, now); }
+            entry.0 += 1;
+            if entry.0 > c.max_requests && c.action == "block" {
+                exceeded = true;
+                stats.rate_limited_today += 1;
+            }
+        }
+        if exceeded {
+            state.storage.append_security_event(&new_security_event(
+                "rate_limit", "rate_exceeded", "block", "medium", source_ip, url,
+                "", "速率限制", &format!("超过 {} 次/{}秒 限制", c.max_requests, c.window_secs),
+            ));
+            return Some(json!({
+                "ok": false, "blocked": true, "stage": "rate_limit",
+                "error": {"code": "SEC_RATE_LIMITED", "message": format!("请求频率超限（{} 次/{}秒）", c.max_requests, c.window_secs)},
+            }));
+        }
+    }
+
+    // 4. WAF 规则检查
+    let rules = state.storage.load_waf_rules();
+    let matches = waf_check_request(&rules, url, headers, body);
+    if !matches.is_empty() {
+        // 更新命中计数
+        let mut rules_mut = state.storage.load_waf_rules();
+        let mut changed = false;
+        for m in &matches {
+            if let Some(r) = rules_mut.iter_mut().find(|r| r.id == m.rule_id) {
+                r.hit_count += 1;
+                changed = true;
+            }
+        }
+        if changed { state.storage.save_waf_rules(&rules_mut); }
+        let blocked_count = matches.iter().filter(|m| m.action == "block").count();
+        {
+            let mut stats = state.security_stats.lock().await;
+            stats.roll_day();
+            stats.waf_blocked_today += blocked_count as u64;
+            stats.waf_logged_today += (matches.len() - blocked_count) as u64;
+        }
+        for m in &matches {
+            // log 动作的命中对本机回环流量不记录事件（避免 Host: localhost 等误报刷屏）
+            if m.action != "block" && is_local { continue; }
+            state.storage.append_security_event(&new_security_event(
+                "waf", &m.rule_type, &m.action, &m.severity, source_ip, url,
+                &m.rule_id, &m.rule_name, &format!("命中: {}", m.matched_text),
+            ));
+            // 同步写 waf_events.jsonl，保持 waf.events.list 数据一致
+            state.storage.append_waf_event(&WafEvent {
+                id: format!("we-{:016x}", rand_u128()),
+                rule_id: m.rule_id.clone(),
+                rule_name: m.rule_name.clone(),
+                rule_type: m.rule_type.clone(),
+                action: m.action.clone(),
+                severity: m.severity.clone(),
+                url: url.chars().take(300).collect(),
+                source_ip: source_ip.to_string(),
+                user_agent: String::new(),
+                matched_text: m.matched_text.clone(),
+                ts: now,
+            });
+        }
+        if blocked_count > 0 {
+            let blocking: Vec<&WafMatch> = matches.iter().filter(|m| m.action == "block").collect();
+            let first = blocking[0];
+            return Some(json!({
+                "ok": false, "blocked": true, "stage": "waf",
+                "error": {"code": "SEC_WAF_BLOCKED", "message": format!("请求被 WAF 拦截: {} ({})", first.rule_name, first.rule_type)},
+                "matchedRules": blocking.iter().map(|m| json!({
+                    "ruleId": m.rule_id, "ruleName": m.rule_name,
+                    "ruleType": m.rule_type, "severity": m.severity,
+                })).collect::<Vec<_>>(),
+            }));
+        }
+    }
+
+    // 5. IDS 行为分析（轻量内联：单 IP 请求突发 => 疑似扫描/爬取）
+    {
+        let mut stats = state.security_stats.lock().await;
+        stats.roll_day();
+        let entry = stats.req_counters.entry(source_ip.to_string()).or_insert((0, now));
+        if now - entry.1 > 60_000 { *entry = (0, now); }
+        entry.0 += 1;
+        if entry.0 == 300 {
+            stats.ids_detected_today += 1;
+            drop(stats);
+            state.storage.append_security_event(&new_security_event(
+                "ids", "behavior_anomaly", "log", "medium", source_ip, url,
+                "", "IDS 行为分析", "单 IP 60 秒内 300+ 请求，疑似扫描/爬取行为",
+            ));
+            state.storage.append_ids_event(&IdsEvent {
+                id: format!("ids-ev-{:016x}", rand_u128()),
+                event_type: "behavior_anomaly".to_string(),
+                source: source_ip.to_string(),
+                detail: "单 IP 60 秒内 300+ 请求，疑似扫描/爬取行为".to_string(),
+                severity: "medium".to_string(),
+                blocked: false,
+                ban_duration_secs: 0,
+                ts: now,
+            });
+        }
+    }
+
+    None
+}
+
+/// 从 HTTP 请求头提取客户端 IP（仅当对端为回环地址时信任代理头，防 XFF 伪造绕过）
+fn extract_client_ip(request: &str, peer_ip: &str) -> String {
+    let peer_is_loopback = peer_ip == "127.0.0.1" || peer_ip == "::1";
+    if peer_is_loopback {
+        for line in request.lines() {
+            let lower = line.to_lowercase();
+            if lower.starts_with("x-real-ip:") {
+                if let Some(v) = line.splitn(2, ':').nth(1) {
+                    let v = v.trim();
+                    if validate_ip_str(v).is_ok() { return v.to_string(); }
+                }
+            }
+            if lower.starts_with("x-forwarded-for:") {
+                if let Some(v) = line.splitn(2, ':').nth(1) {
+                    if let Some(first) = v.split(',').next() {
+                        let first = first.trim();
+                        if validate_ip_str(first).is_ok() { return first.to_string(); }
+                    }
+                }
+            }
+        }
+    }
+    peer_ip.to_string()
+}
+
+/// 统一安全事件导出为 CSV
+fn security_events_to_csv(events: &[SecurityEvent]) -> String {
+    fn esc(s: &str) -> String {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+    let mut out = String::from("id,category,eventType,action,severity,sourceIp,target,ruleId,ruleName,detail,ts\n");
+    for e in events {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
+            esc(&e.id), esc(&e.category), esc(&e.event_type), esc(&e.action),
+            esc(&e.severity), esc(&e.source_ip), esc(&e.target), esc(&e.rule_id),
+            esc(&e.rule_name), esc(&e.detail), e.ts,
+        ));
+    }
+    out
 }
 
 // ============================================================================
@@ -18027,8 +19488,22 @@ async fn handle_websocket_connection(
     mut stream: tokio::net::TcpStream,
     request: String,
     state: Arc<AppState>,
+    peer_ip: &str,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 安全中心统一入口：白名单放行 → 黑名单/封禁阻断 → 速率限制 → WAF 规则 → IDS 行为分析
+    let client_ip = extract_client_ip(&request, peer_ip);
+    let ws_path = request.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("/ws");
+    if let Some(block) = security_check_request(&state, &client_ip, ws_path, &request, "").await {
+        let body = block.to_string();
+        let resp = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(), body
+        );
+        let _ = stream.write_all(resp.as_bytes()).await;
+        return;
+    }
 
     // ---- Origin 检查（防浏览器跨站 WS 攻击）----
     // 浏览器发的 WS 握手必带 Origin；非浏览器（curl/脚本）通常不带，放行由后续认证兜底
@@ -18256,8 +19731,9 @@ fn main() {
                     // 启动渠道后台任务
                     let chan_state = state.clone();
                     spawn_channel_background_tasks(chan_state);
-                    while let Ok((stream, _)) = listener.accept().await {
+                    while let Ok((stream, peer)) = listener.accept().await {
                         let st = state.clone();
+                        let client_ip = peer.ip().to_string();
                         tokio::spawn(async move {
                             let mut stream = stream;
                             // 读 HTTP 请求头（修复：加 10s 读取超时，防 slowloris 慢连接耗尽 task）
@@ -18273,9 +19749,9 @@ fn main() {
                             if n == 0 { return; }
                             let request = String::from_utf8_lossy(&buf[..n]).to_string();
                             if request.contains("Upgrade: websocket") || request.contains("upgrade: websocket") {
-                                handle_websocket_connection(stream, request, st).await;
+                                handle_websocket_connection(stream, request, st, &client_ip).await;
                             } else {
-                                handle_http(&mut stream, &request, st).await;
+                                handle_http(&mut stream, &request, st, &client_ip).await;
                             }
                         });
                     }
@@ -18293,6 +19769,35 @@ fn main() {
             match std::net::TcpStream::connect("127.0.0.1:18800") {
                 Ok(_) => println!("  网关: 运行中 ✓"),
                 Err(_) => println!("  网关: 未运行"),
+            }
+        }
+        "agent" => {
+            // 节点 agent 模式（由 nodes.generate_agent_code 生成的一键安装脚本部署）
+            match args.get(2).map(|s| s.as_str()) {
+                Some("install") => {
+                    println!("CradleRing agent 已安装");
+                    println!("  配置文件: /etc/cradle-ring/agent.conf");
+                    println!("  心跳服务: systemctl status cradle-ring-agent");
+                }
+                Some("run") => {
+                    // 读取一键安装脚本写入的配置并启动心跳循环
+                    let conf_path = std::env::var("CRADLE_AGENT_CONF")
+                        .unwrap_or_else(|_| "/etc/cradle-ring/agent.conf".to_string());
+                    let conf = load_agent_conf(&conf_path);
+                    let gateway = conf.get("GATEWAY").cloned().unwrap_or_default();
+                    let node_id = conf.get("NODE_ID").cloned().unwrap_or_default();
+                    let node_token = conf.get("NODE_TOKEN").cloned().unwrap_or_default();
+                    let interval: u64 = conf.get("HEARTBEAT_INTERVAL")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30);
+                    if gateway.is_empty() || node_id.is_empty() || node_token.is_empty() {
+                        eprintln!("agent 配置不完整（{}）：需要 GATEWAY / NODE_ID / NODE_TOKEN", conf_path);
+                        std::process::exit(1);
+                    }
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(agent_heartbeat_loop(gateway, node_id, node_token, interval));
+                }
+                _ => println!("用法: cradle-ring agent <install|run>"),
             }
         }
         "onboard" => {
@@ -18414,7 +19919,7 @@ mod tests {
 
     #[test]
     fn channel_query_decode() {
-        assert_eq!(url_decode("hello%20world"), "hello world");
+        assert_eq!(decode_uri("hello%20world"), "hello world");
     }
 
     #[test]
