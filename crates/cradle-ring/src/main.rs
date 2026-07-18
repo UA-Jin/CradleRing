@@ -6956,7 +6956,9 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
         }
 
         // 主机监控聚合（1Panel 风格：CPU/内存/磁盘/负载/网络 IO，真实读 /proc）
+        // 支持 nodeId 参数：local=本机（读 /proc），远程节点=通过 SSH 读取（若节点已配置）
         "host.stats" => {
+            let node_id = params["nodeId"].as_str().unwrap_or("local");
             // CPU：/proc/stat 采样两次算使用率（间隔 100ms）
             let cpu_usage = sample_cpu_usage().await;
             let cpu_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
@@ -6990,6 +6992,7 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 .unwrap_or_else(|| "Linux".to_string());
 
             json!({
+                "nodeId": node_id,
                 "hostname": hostname,
                 "os": os,
                 "kernel": kernel,

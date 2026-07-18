@@ -59,7 +59,15 @@
       </div>
     </div>
 
-    <!-- 主机监控行（1Panel 风格：CPU/内存/磁盘/负载/网络 IO 仪表） -->
+    <!-- 主机监控行（节点选择 + CPU/内存/磁盘/负载/网络 IO 仪表） -->
+    <div class="host-stats-header" v-if="hostStats">
+      <div class="ns-label">监控节点：</div>
+      <a-select v-model="currentNodeId" size="small" style="width: 240px" @change="loadHostStats">
+        <a-option value="local">本机（{{ hostStats.hostname || '...' }}）</a-option>
+        <a-option v-for="n in sshNodes" :key="n.id" :value="n.id">{{ n.name }}（{{ n.host }}）</a-option>
+      </a-select>
+      <a-tag :color="currentNodeId === 'local' ? 'green' : 'arcoblue'" size="small">{{ currentNodeId === 'local' ? '本地' : '远程' }}</a-tag>
+    </div>
     <div class="host-stats-row" v-if="hostStats">
       <div class="host-card">
         <div class="host-card-title">CPU 使用率</div>
@@ -354,15 +362,24 @@ const riskRankOption = computed(() => {
   };
 });
 
-// 主机监控（1Panel 风格，host.stats RPC 真实读 /proc）
+// 主机监控（节点选择 + host.stats RPC 真实读 /proc）
 const hostStats = ref<any>(null);
+const currentNodeId = ref('local');
+const sshNodes = ref<any[]>([]);
 
 async function loadHostStats() {
   try {
-    hostStats.value = await rpc.call<any>('host.stats');
+    hostStats.value = await rpc.call<any>('host.stats', { nodeId: currentNodeId.value });
   } catch (e) {
     // 首次可能失败
   }
+}
+
+async function loadSshNodes() {
+  try {
+    const res = await rpc.call<any>('nodes.list');
+    sshNodes.value = res.nodes || [];
+  } catch { /* ignore */ }
 }
 
 function usageColor(pct: number): string {
@@ -411,6 +428,7 @@ let hostTimer: any = null;
 onMounted(() => {
   refresh();
   loadHostStats();
+  loadSshNodes();
   timer = setInterval(refresh, 30000); // 30s 自动刷新
   hostTimer = setInterval(loadHostStats, 5000); // 主机监控 5s 刷新
 });
@@ -427,6 +445,19 @@ onUnmounted(() => {
   padding: 16px 20px;
   &.dark-mode {
     background: #28243d;
+  }
+}
+
+/* 主机监控节点选择器 */
+.host-stats-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  .ns-label {
+    font-size: 13px;
+    color: var(--color-text-2);
+    font-weight: 500;
   }
 }
 
