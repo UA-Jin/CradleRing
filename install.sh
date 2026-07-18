@@ -219,8 +219,89 @@ clone_source() {
     echo "$tmp_dir"
 }
 
+# 根据可用内存自动限制 cargo 并行度，避免 OOM (SIGKILL)
+# 大依赖（如 serde/reqwest/tokio）release 编译单 crate 可能需要 ~1.5GB
+configure_cargo_jobs() {
+    # 用户已显式设置则尊重
+    if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
+        ui_info "CARGO_BUILD_JOBS 已由用户设置: $CARGO_BUILD_JOBS"
+        return 0
+    fi
+    local mem_mb=0
+    # Linux: MemAvailable（最准确）
+    if [[ -r /proc/meminfo ]]; then
+        mem_mb=$(awk '/MemAvailable/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+        [[ -z "$mem_mb" || "$mem_mb" == "0" ]] && mem_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    fi
+    # macOS: sysctl
+    if [[ "$mem_mb" == "0" ]] && command -v sysctl >/dev/null 2>&1; then
+        mem_mb=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%d", $1/1024/1024}')
+    fi
+    # fallback
+    [[ -z "$mem_mb" || "$mem_mb" == "0" ]] && mem_mb=2048
+
+    # 每 GB 内存最多 1 个并行任务（保守估计）
+    # 另外根据 CPU 核数限制（不超过 nproc）
+    local nproc
+    nproc=$(nproc 2>/dev/null || echo 4)
+    local by_mem=$(( mem_mb / 1024 ))
+    [[ "$by_mem" -lt 1 ]] && by_mem=1
+    local jobs=$(( by_mem < nproc ? by_mem : nproc ))
+    # 强制最小 1，最大 8
+    [[ "$jobs" -lt 1 ]] && jobs=1
+    [[ "$jobs" -gt 8 ]] && jobs=8
+
+    export CARGO_BUILD_JOBS="$jobs"
+    if [[ "$jobs" -le 2 ]]; then
+        ui_warn "检测到内存 ${mem_mb}MB 较少，限制 cargo 并行度为 $jobs（防 OOM）"
+        ui_info "如构建仍失败，可尝试: sudo swapfile 创建 2GB swap 后重试"
+    else
+        ui_info "内存 ${mem_mb}MB，cargo 并行度 = $jobs"
+    fi
+}
+
+# 尝试创建 swap 文件（OOM 兜底，仅 root + Linux + 无 swap 时）
+ensure_swap_for_build() {
+    [[ "$EUID" -ne 0 ]] && return 0
+    [[ "$(uname -s)" != "Linux" ]] && return 0
+    # 已有 swap 则跳过
+    local current_swap
+    current_swap=$(awk '/SwapTotal/ {print $2}' /proc/meminfo 2>/dev/null)
+    [[ -n "$current_swap" && "$current_swap" -gt 1048576 ]] && return 0  # >1GB 已够
+
+    local swap_file="/swapfile_cradlering"
+    if [[ -f "$swap_file" ]]; then
+        # 已存在但未启用？
+        swapon "$swap_file" 2>/dev/null && ui_info "已启用已有 swap: $swap_file"
+        return 0
+    fi
+    # 仅在内存 <2GB 时主动创建
+    local mem_mb
+    mem_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    [[ -z "$mem_mb" || "$mem_mb" -gt 2048 ]] && return 0
+
+    ui_warn "内存 ${mem_mb}MB 较少，正在创建 2GB swap 以避免 OOM..."
+    if fallocate -l 2G "$swap_file" 2>/dev/null || dd if=/dev/zero of="$swap_file" bs=1M count=2048 2>/dev/null; then
+        chmod 600 "$swap_file" 2>/dev/null
+        mkswap "$swap_file" >/dev/null 2>&1
+        if swapon "$swap_file" 2>/dev/null; then
+            ui_success "swap 已创建并启用: $swap_file (2GB)"
+            # 注册卸载钩子（安装结束时可选保留）
+            REGISTERED_SWAP_FILE="$swap_file"
+        else
+            ui_warn "swap 启用失败，继续构建（可能 OOM）"
+            rm -f "$swap_file" 2>/dev/null
+        fi
+    else
+        ui_warn "swap 文件创建失败，继续构建（可能 OOM）"
+    fi
+}
+
 install_cradle_ring() {
     ui_step "编译 CradleRing（cargo build --release）..."
+    # OOM 防护：限制并行度 + 创建 swap
+    configure_cargo_jobs
+    ensure_swap_for_build
     local src_dir="$SCRIPT_DIR"
     # curl|bash 模式：自动从 GitHub 克隆源码
     if is_curl_bash_mode; then
