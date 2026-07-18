@@ -7,6 +7,14 @@
             <template #icon><icon-refresh /></template>
             刷新
           </a-button>
+          <a-button @click="openImport">
+            <template #icon><icon-upload /></template>
+            导入数据集
+          </a-button>
+          <a-button v-if="v2Count > 0" status="warning" @click="openMigrate">
+            <template #icon><icon-swap /></template>
+            迁移旧版数据 ({{ v2Count }})
+          </a-button>
           <a-button type="primary" @click="openCreate">
             <template #icon><icon-plus /></template>
             添加记忆
@@ -136,6 +144,104 @@
         </a-form-item>
       </a-form>
     </a-modal>
+
+    <!-- 导入数据集对话框 -->
+    <a-modal :visible="importVisible" title="导入数据集" @cancel="importVisible = false" @ok="onImport" :ok-loading="importing" :width="680">
+      <a-form :model="importForm" layout="vertical">
+        <a-form-item label="数据格式">
+          <a-radio-group v-model="importForm.format" type="button">
+            <a-radio value="json">JSON 数组</a-radio>
+            <a-radio value="jsonl">JSONL</a-radio>
+            <a-radio value="csv">CSV</a-radio>
+            <a-radio value="txt">纯文本</a-radio>
+          </a-radio-group>
+        </a-form-item>
+
+        <a-form-item>
+          <template #label>
+            <span>数据内容</span>
+            <a-tooltip content="也可以直接粘贴文本，或选择文件自动填充">
+              <icon-question-circle class="ml-8" />
+            </a-tooltip>
+          </template>
+          <a-upload
+            :auto-upload="false"
+            :show-file-list="false"
+            accept=".json,.jsonl,.csv,.txt"
+            @change="onImportFile"
+          >
+            <template #upload-button>
+              <a-button size="small" class="mb-8">
+                <template #icon><icon-folder-add /></template>
+                选择文件（自动读取到下方）
+              </a-button>
+            </template>
+          </a-upload>
+          <a-textarea
+            v-model="importForm.data"
+            :auto-size="{ minRows: 10, maxRows: 16 }"
+            :placeholder="importPlaceholder"
+            style="font-family: monospace; font-size: 12px"
+          />
+        </a-form-item>
+
+        <a-row :gutter="12">
+          <a-col :span="8">
+            <a-form-item label="默认类型">
+              <a-select v-model="importForm.defaultKind">
+                <a-option v-for="k in kindOptions" :key="k.value" :value="k.value">{{ k.label }}</a-option>
+              </a-select>
+            </a-form-item>
+          </a-col>
+          <a-col :span="8">
+            <a-form-item label="默认来源">
+              <a-input v-model="importForm.defaultSource" placeholder="import" />
+            </a-form-item>
+          </a-col>
+          <a-col :span="8">
+            <a-form-item label="默认标签（逗号分隔）">
+              <a-input v-model="importForm.defaultTagsStr" placeholder="可选" />
+            </a-form-item>
+          </a-col>
+        </a-row>
+
+        <!-- 导入结果 -->
+        <a-alert v-if="importResult" :type="importResult.ok ? 'success' : 'error'" class="mt-8">
+          <template v-if="importResult.ok">
+            导入完成：成功 {{ importResult.imported }} 条
+            <template v-if="importResult.failed">，失败 {{ importResult.failed }} 条</template>
+            <template v-if="importResult.parseErrors">，解析错误 {{ importResult.parseErrors }} 条</template>
+          </template>
+          <template v-else>
+            导入失败：{{ importResult.error }}
+          </template>
+        </a-alert>
+      </a-form>
+    </a-modal>
+
+    <!-- 迁移旧版数据对话框 -->
+    <a-modal :visible="migrateVisible" title="迁移旧版数据到 V3" @cancel="migrateVisible = false" @ok="onMigrate" :ok-loading="migrating" :width="520">
+      <a-alert type="info" class="mb-16">
+        检测到旧版记忆库（V2）有 <b>{{ v2Count }}</b> 条数据。迁移会把它们导入 V3 向量库（生成向量 + 图谱），旧数据保留不动。
+      </a-alert>
+      <a-form layout="vertical">
+        <a-form-item>
+          <a-checkbox v-model="migrateOverwrite">
+            覆盖模式（不跳过 V3 已存在的相同内容）
+          </a-checkbox>
+          <div class="migrate-hint">默认跳过 V3 已有的相同内容，避免重复</div>
+        </a-form-item>
+      </a-form>
+      <a-alert v-if="migrateResult" :type="migrateResult.ok ? 'success' : 'error'" class="mt-8">
+        <template v-if="migrateResult.ok">
+          迁移完成：导入 {{ migrateResult.migrated }} 条，跳过 {{ migrateResult.skipped }} 条
+          <template v-if="migrateResult.failed">，失败 {{ migrateResult.failed }} 条</template>
+        </template>
+        <template v-else>
+          迁移失败：{{ migrateResult.error }}
+        </template>
+      </a-alert>
+    </a-modal>
   </div>
 </template>
 
@@ -149,7 +255,8 @@ import { rpc } from '@/api/rpc';
 import {
   IconBookmark, IconSearch, IconLoading, IconRefresh, IconPlus,
   IconCopy, IconDelete, IconFire, IconTag, IconClockCircle, IconUserGroup,
-  IconStorage, IconRelation, IconCheckCircle,
+  IconStorage, IconRelation, IconCheckCircle, IconUpload, IconSwap,
+  IconFolderAdd, IconQuestionCircle,
 } from '@arco-design/web-vue/es/icon';
 
 dayjs.extend(relativeTime);
@@ -157,7 +264,7 @@ dayjs.locale('zh-cn');
 
 // ---------- 类型定义 ----------
 interface MemoryItem {
-  id: number;
+  id: string | number;  // V3 是字符串 id，V2 遗留是数字 id
   body: string;
   kind: string;
   source?: string;
@@ -206,6 +313,38 @@ const stats = ref({ total: 0, byKind: {} as Record<string, number>, avgHits: 0 }
 const visible = ref(false);
 const saving = ref(false);
 const form = reactive({ body: '', kind: 'fact', tagsStr: '', source: 'admin' });
+
+// ---------- 导入数据集 ----------
+const importVisible = ref(false);
+const importing = ref(false);
+const importResult = ref<any>(null);
+const importForm = reactive({
+  format: 'json',
+  data: '',
+  defaultKind: 'fact',
+  defaultSource: 'import',
+  defaultTagsStr: '',
+});
+
+const importPlaceholder = computed(() => {
+  switch (importForm.format) {
+    case 'json':
+      return '[\n  { "body": "记忆内容", "kind": "fact", "source": "import", "tags": ["标签"] },\n  ...\n]';
+    case 'jsonl':
+      return '{"body": "每行一个 JSON 对象", "kind": "fact"}\n{"body": "第二条", "kind": "preference"}';
+    case 'csv':
+      return 'body,kind,source,tags\n"记忆内容,含逗号",fact,import,标签1;标签2';
+    default:
+      return '每行一条记忆...\n第二行是第二条记忆...';
+  }
+});
+
+// ---------- 迁移旧版 ----------
+const migrateVisible = ref(false);
+const migrating = ref(false);
+const migrateOverwrite = ref(false);
+const migrateResult = ref<any>(null);
+const v2Count = ref(0);
 
 // ---------- 计算属性 ----------
 const displayItems = computed(() => {
@@ -324,11 +463,11 @@ async function onSave() {
   }
 }
 
-async function onDelete(id: number) {
+async function onDelete(id: string | number) {
   try {
-    await rpc.call('memory.delete', { id });
+    await rpc.call('memory.delete', { id: String(id) });
     Message.success('已删除');
-    await Promise.all([load(), loadStats()]);
+    await Promise.all([load(), loadStats(), loadV2Count()]);
   } catch (e: any) {
     Message.error(e.message);
   }
@@ -343,8 +482,96 @@ async function copyText(text: string) {
   }
 }
 
+// ---------- 导入数据集方法 ----------
+function openImport() {
+  importForm.data = '';
+  importResult.value = null;
+  importVisible.value = true;
+}
+
+function onImportFile(_fileList: any, fileItem: any) {
+  const file = fileItem?.file;
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    importForm.data = String(e.target?.result || '');
+    // 按扩展名自动识别格式
+    const name = (file.name || '').toLowerCase();
+    if (name.endsWith('.jsonl')) importForm.format = 'jsonl';
+    else if (name.endsWith('.csv')) importForm.format = 'csv';
+    else if (name.endsWith('.txt')) importForm.format = 'txt';
+    else importForm.format = 'json';
+    Message.success(`已读取 ${file.name}（${(file.size / 1024).toFixed(1)}KB），格式识别为 ${importForm.format.toUpperCase()}`);
+  };
+  reader.readAsText(file);
+}
+
+async function onImport() {
+  if (!importForm.data.trim()) {
+    Message.warning('请先粘贴数据或选择文件');
+    return;
+  }
+  importing.value = true;
+  importResult.value = null;
+  try {
+    const defaultTags = importForm.defaultTagsStr
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const res = await rpc.call<any>('memory2.import', {
+      format: importForm.format,
+      data: importForm.data,
+      defaultKind: importForm.defaultKind,
+      defaultSource: importForm.defaultSource || 'import',
+      defaultTags,
+    });
+    importResult.value = res;
+    if (res.ok) {
+      Message.success(`成功导入 ${res.imported} 条记忆`);
+      await Promise.all([load(), loadStats()]);
+    }
+  } catch (e: any) {
+    importResult.value = { ok: false, error: e.message };
+  } finally {
+    importing.value = false;
+  }
+}
+
+// ---------- 迁移旧版数据方法 ----------
+function openMigrate() {
+  migrateResult.value = null;
+  migrateOverwrite.value = false;
+  migrateVisible.value = true;
+}
+
+async function onMigrate() {
+  migrating.value = true;
+  migrateResult.value = null;
+  try {
+    const res = await rpc.call<any>('memory2.migrate_v2', { overwrite: migrateOverwrite.value });
+    migrateResult.value = res;
+    if (res.ok) {
+      Message.success(`迁移完成：${res.migrated} 条`);
+      await Promise.all([load(), loadStats(), loadV2Count()]);
+    }
+  } catch (e: any) {
+    migrateResult.value = { ok: false, error: e.message };
+  } finally {
+    migrating.value = false;
+  }
+}
+
+async function loadV2Count() {
+  try {
+    const res = await rpc.call<any>('memory.stats');
+    v2Count.value = res.stats?.v2_total || 0;
+  } catch {
+    v2Count.value = 0;
+  }
+}
+
 onMounted(async () => {
-  await Promise.all([load(), loadStats()]);
+  await Promise.all([load(), loadStats(), loadV2Count()]);
 });
 </script>
 
@@ -422,4 +649,14 @@ onMounted(async () => {
     gap: 4px;
   }
 }
+
+.migrate-hint {
+  font-size: 12px;
+  color: var(--color-text-4);
+  margin-top: 4px;
+}
+
+.mb-8 { margin-bottom: 8px; }
+.mb-16 { margin-bottom: 16px; }
+.ml-8 { margin-left: 8px; }
 </style>

@@ -37,6 +37,7 @@ class RpcClient {
   private connecting: Promise<void> | null = null;
   private reconnectAttempts = 0;
   private ready = false;
+  private authenticated = false;
 
   /** REST 登录 */
   async login(username: string, password: string): Promise<{ token: string; user: User }> {
@@ -52,7 +53,45 @@ class RpcClient {
     this.token = data.token;
     localStorage.setItem('cradle_token', this.token);
     localStorage.setItem('cradle_user', JSON.stringify(data.user));
+    // 关键修复：登录成功后，若 WS 已连接（之前以空 token hello 失败），重新认证
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.reauthenticate().catch(() => {});
+    }
     return { token: data.token, user: data.user as User };
+  }
+
+  /** 重新认证（token 更新后重新 hello） */
+  async reauthenticate(): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    const gwToken = await this.fetchGatewayToken();
+    const id = `hello-${this.nextId++}`;
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        resolve(false);
+      }, 5000);
+      this.pending.set(id, {
+        resolve: () => {
+          clearTimeout(timer);
+          this.authenticated = true;
+          resolve(true);
+        },
+        reject: () => {
+          clearTimeout(timer);
+          this.authenticated = false;
+          resolve(false);
+        },
+        timer,
+      });
+      this.ws!.send(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'hello',
+          params: { token: gwToken, auth_token: this.getToken(), client: 'cradle-webui', version: '1.0' },
+          id,
+        }),
+      );
+    });
   }
 
   logout() {
@@ -65,6 +104,7 @@ class RpcClient {
     }
     this.connected = false;
     this.ready = false;
+    this.authenticated = false;
   }
 
   getToken(): string {
@@ -110,7 +150,6 @@ class RpcClient {
   private async _doConnect(): Promise<void> {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${proto}//${location.host}/ws`;
-    const gwToken = await this.fetchGatewayToken();
 
     return new Promise((resolve, reject) => {
       let opened = false;
@@ -121,16 +160,20 @@ class RpcClient {
       ws.onopen = () => {
         opened = true;
         this.connected = true;
-        // 发送 hello，完成握手（后端不强制校验 sha1，直接可以发 RPC）
-        ws.send(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            method: 'hello',
-            params: { token: gwToken, auth_token: this.getToken(), client: 'cradle-webui', version: '1.0' },
-            id: String(this.nextId++),
-          }),
-        );
-        // 标记就绪（不等待 hello-ok，后端任何 RPC 都可立即响应）
+        // 发送 hello（作为 pending 调用，可追踪认证结果）
+        this.reauthenticate().then((ok) => {
+          this.authenticated = ok;
+          if (!ok && this.getToken()) {
+            // 本地有 token 但认证失败 → token 失效，清除并跳登录
+            this.token = '';
+            localStorage.removeItem('cradle_token');
+            localStorage.removeItem('cradle_user');
+            if (location.pathname !== '/login') {
+              location.href = '/login';
+            }
+          }
+        });
+        // 标记就绪（不等待 hello-ok，RPC 遇到 UNAUTHORIZED 会自动重试）
         this.ready = true;
         this.reconnectAttempts = 0;
         resolve();
@@ -187,8 +230,28 @@ class RpcClient {
     }
   }
 
-  /** 调用 RPC 方法 */
+  /** 调用 RPC 方法（遇到 UNAUTHORIZED 自动重新认证重试一次） */
   async call<T = any>(method: string, params: Record<string, any> = {}): Promise<T> {
+    try {
+      return await this._callOnce<T>(method, params);
+    } catch (e: any) {
+      const msg = String(e?.message || '');
+      if (msg.includes('未认证') || msg.includes('UNAUTHORIZED') || msg.includes('AUTH_FAILED')) {
+        // 重新认证后重试一次
+        const ok = await this.reauthenticate();
+        if (ok) {
+          return await this._callOnce<T>(method, params);
+        }
+        // 认证仍失败：如果本地没 token，跳登录页
+        if (!this.getToken() && location.pathname !== '/login') {
+          location.href = '/login';
+        }
+      }
+      throw e;
+    }
+  }
+
+  private async _callOnce<T = any>(method: string, params: Record<string, any> = {}): Promise<T> {
     await this.connect();
     const id = String(this.nextId++);
     return new Promise<T>((resolve, reject) => {

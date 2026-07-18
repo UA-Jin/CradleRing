@@ -1,75 +1,139 @@
 <template>
   <div class="page-container">
-    <a-page-header title="用户管理" subtitle="多账号系统 · 角色权限 · 自定义角色" :show-back="false">
-      <template #extra>
-        <a-space>
-          <a-input v-model="searchKey" placeholder="搜索用户..." allow-clear style="width: 200px" />
-          <a-button @click="showRoleManager = true"><template #icon><icon-settings /></template>管理角色</a-button>
-          <a-button type="primary" @click="openCreate"><template #icon><icon-plus /></template>新建用户</a-button>
-        </a-space>
-      </template>
-    </a-page-header>
-
-    <!-- 角色统计 -->
-    <a-row :gutter="12" class="mt-16">
-      <a-col :xs="12" :md="6" v-for="r in roleSummary" :key="r.role">
-        <a-card>
-          <a-statistic :title="r.label" :value="r.count">
-            <template #prefix><a-avatar :size="28" :style="{ backgroundColor: r.color }">{{ r.label.charAt(0) }}</a-avatar></template>
-          </a-statistic>
+    <!-- 统计卡（Materialize：标题 + 大数字 + 百分比徽章 + 副标题 + 右上小彩色图标） -->
+    <a-row :gutter="24">
+      <a-col :xs="12" :lg="6" v-for="s in statCards" :key="s.title">
+        <a-card class="stat-card">
+          <div class="stat-title">{{ s.title }}</div>
+          <div class="stat-main">
+            <span class="stat-num">{{ s.value }}</span>
+            <span class="stat-badge" :class="s.badgeClass">{{ s.badge }}</span>
+          </div>
+          <div class="stat-sub">{{ s.sub }}</div>
+          <div class="stat-icon" :style="{ background: s.iconBg }">
+            <component :is="s.icon" />
+          </div>
         </a-card>
       </a-col>
     </a-row>
 
-    <a-table class="mt-16" :data="filteredUsers" :loading="loading" :pagination="{ pageSize: 15, showTotal: true }" row-key="id">
-      <template #columns>
-        <a-table-column title="用户" :width="180">
-          <template #cell="{ record }">
-            <a-space>
-              <a-avatar :size="32" :style="{ backgroundColor: roleColor(record.role) }">{{ record.displayName?.charAt(0) || record.username.charAt(0) }}</a-avatar>
-              <div>
-                <div>{{ record.displayName }}</div>
-                <div class="muted">@{{ record.username }}</div>
+    <!-- Filters（Materialize：Export + Search + Add New User） -->
+    <a-card class="mt-24">
+      <div class="filter-bar">
+        <a-dropdown trigger="click">
+          <a-button>
+            <template #icon><icon-download /></template>
+            导出 <icon-down />
+          </a-button>
+          <template #content>
+            <a-doption @click="exportUsers('json')">导出 JSON</a-doption>
+            <a-doption @click="exportUsers('csv')">导出 CSV</a-doption>
+          </template>
+        </a-dropdown>
+        <div class="filter-right">
+          <a-input v-model="searchKey" placeholder="搜索用户..." allow-clear style="width: 240px">
+            <template #prefix><icon-search /></template>
+          </a-input>
+          <a-button type="primary" @click="openCreate">
+            <template #icon><icon-plus /></template>
+            新建用户
+          </a-button>
+        </div>
+      </div>
+
+      <a-table class="mt-16" :data="filteredUsers" :loading="loading" :pagination="{ pageSize: 15, showTotal: true }" row-key="id" :bordered="false">
+        <template #columns>
+          <a-table-column title="用户" :width="220">
+            <template #cell="{ record }">
+              <a-space>
+                <a-avatar :size="34" :style="{ backgroundColor: roleColor(record.role) }">{{ (record.displayName || record.username).charAt(0).toUpperCase() }}</a-avatar>
+                <div>
+                  <div class="cell-name">{{ record.displayName }}</div>
+                  <div class="muted">@{{ record.username }}</div>
+                </div>
+              </a-space>
+            </template>
+          </a-table-column>
+          <a-table-column title="角色" :width="110">
+            <template #cell="{ record }">
+              <a-tag :color="roleColor(record.role)">{{ roleLabel(record.role) }}</a-tag>
+            </template>
+          </a-table-column>
+          <a-table-column title="邮箱" data-index="email" :width="200" ellipsis tooltip>
+            <template #cell="{ record }">{{ record.email || '-' }}</template>
+          </a-table-column>
+          <a-table-column title="权限" :width="200">
+            <template #cell="{ record }">
+              <a-space wrap>
+                <a-tag v-for="s in (record.scopes || []).slice(0, 3)" :key="s" size="small">{{ s }}</a-tag>
+                <a-tag v-if="(record.scopes || []).length > 3" size="small">+{{ record.scopes.length - 3 }}</a-tag>
+              </a-space>
+            </template>
+          </a-table-column>
+          <a-table-column title="状态" :width="90">
+            <template #cell="{ record }">
+              <a-badge :status="record.enabled ? 'success' : 'default'" :text="record.enabled ? '正常' : '禁用'" />
+            </template>
+          </a-table-column>
+          <a-table-column title="最后登录" :width="140">
+            <template #cell="{ record }">{{ record.lastLogin ? dayjs(record.lastLogin).format('MM-DD HH:mm') : '从未' }}</template>
+          </a-table-column>
+          <a-table-column title="操作" :width="150" fixed="right">
+            <template #cell="{ record }">
+              <a-space>
+                <a-button size="small" type="text" @click="openEdit(record)"><icon-edit /></a-button>
+                <a-popconfirm content="确认删除该用户？" @ok="onDelete(record.id)" :disabled="record.username === 'admin'">
+                  <a-button size="small" type="text" status="danger" :disabled="record.username === 'admin'"><icon-delete /></a-button>
+                </a-popconfirm>
+              </a-space>
+            </template>
+          </a-table-column>
+        </template>
+      </a-table>
+    </a-card>
+
+    <!-- 角色卡网格（Materialize app-access-roles） -->
+    <div class="roles-header mt-24">
+      <h4 class="roles-title">角色列表</h4>
+      <p class="roles-sub">角色提供预定义的菜单和功能访问权限，管理员可根据分配的角色访问所需内容</p>
+    </div>
+    <a-row :gutter="24" class="mt-8">
+      <a-col :xs="24" :md="12" :lg="8" v-for="r in roleCards" :key="r.name">
+        <a-card class="role-card">
+          <div class="role-users">
+            <span>共 {{ r.count }} 个用户</span>
+            <div class="avatar-stack">
+              <a-avatar v-for="(u, i) in r.users.slice(0, 3)" :key="u.id" :size="28" :style="{ backgroundColor: roleColor(u.role), zIndex: 3 - i, marginLeft: i > 0 ? '-8px' : '0' }">
+                {{ (u.displayName || u.username).charAt(0).toUpperCase() }}
+              </a-avatar>
+              <a-avatar v-if="r.count > 3" :size="28" :style="{ backgroundColor: '#e8e0fe', color: '#8c57ff', marginLeft: '-8px', zIndex: 0 }">+{{ r.count - 3 }}</a-avatar>
+            </div>
+          </div>
+          <div class="role-name-row">
+            <div>
+              <div class="role-name">
+                {{ r.label }}
+                <a-tag v-if="r.builtin" size="small" color="arcoblue">预置</a-tag>
               </div>
-            </a-space>
-          </template>
-        </a-table-column>
-        <a-table-column title="角色" :width="120">
-          <template #cell="{ record }">
-            <a-tag :color="roleColor(record.role)">{{ roleLabel(record.role) }}</a-tag>
-          </template>
-        </a-table-column>
-        <a-table-column title="邮箱" data-index="email" :width="200" ellipsis tooltip>
-          <template #cell="{ record }">{{ record.email || '-' }}</template>
-        </a-table-column>
-        <a-table-column title="权限" :width="200">
-          <template #cell="{ record }">
-            <a-space wrap>
-              <a-tag v-for="s in (record.scopes || []).slice(0, 4)" :key="s" size="small">{{ s }}</a-tag>
-              <a-tag v-if="(record.scopes || []).length > 4" size="small">+{{ record.scopes.length - 4 }}</a-tag>
-            </a-space>
-          </template>
-        </a-table-column>
-        <a-table-column title="状态" :width="80">
-          <template #cell="{ record }">
-            <a-badge :status="record.enabled ? 'success' : 'default'" :text="record.enabled ? '正常' : '禁用'" />
-          </template>
-        </a-table-column>
-        <a-table-column title="最后登录" :width="160">
-          <template #cell="{ record }">{{ record.lastLogin ? dayjs(record.lastLogin).format('MM-DD HH:mm') : '从未' }}</template>
-        </a-table-column>
-        <a-table-column title="操作" :width="180" fixed="right">
-          <template #cell="{ record }">
-            <a-space>
-              <a-button size="small" @click="openEdit(record)">编辑</a-button>
-              <a-popconfirm content="确认删除该用户？" @ok="onDelete(record.id)" :disabled="record.username === 'admin'">
-                <a-button size="small" status="danger" :disabled="record.username === 'admin'">删除</a-button>
-              </a-popconfirm>
-            </a-space>
-          </template>
-        </a-table-column>
-      </template>
-    </a-table>
+              <a-link class="role-edit" @click="openEditRole(r)">编辑角色</a-link>
+            </div>
+            <a-tooltip content="复制角色">
+              <button class="role-copy" @click="duplicateRole(r)"><icon-copy /></button>
+            </a-tooltip>
+          </div>
+        </a-card>
+      </a-col>
+      <!-- Add New Role 卡 -->
+      <a-col :xs="24" :md="12" :lg="8">
+        <a-card class="role-card add-role-card" @click="openCreateRole">
+          <div class="add-role-inner">
+            <div class="add-role-icon"><icon-plus /></div>
+            <a-button type="primary" class="mt-16">新建角色</a-button>
+            <p class="add-role-desc">如果角色不存在，请添加新角色</p>
+          </div>
+        </a-card>
+      </a-col>
+    </a-row>
 
     <!-- 用户编辑抽屉 -->
     <a-drawer :visible="visible" :width="520" @cancel="visible = false" @ok="onSave" :ok-loading="saving">
@@ -121,48 +185,6 @@
       </a-form>
     </a-drawer>
 
-    <!-- 角色管理抽屉 -->
-    <a-drawer :visible="showRoleManager" :width="640" @cancel="showRoleManager = false" :footer="false">
-      <template #title>角色管理</template>
-      <a-space class="mb-16">
-        <a-button type="primary" @click="openCreateRole"><template #icon><icon-plus /></template>新建角色</a-button>
-      </a-space>
-      <a-table :data="allRoles" :pagination="{ pageSize: 20 }" row-key="name">
-        <template #columns>
-          <a-table-column title="角色" :width="140">
-            <template #cell="{ record }">
-              <a-tag :color="record.color">{{ record.label }}</a-tag>
-              <div class="muted">@{{ record.name }}</div>
-            </template>
-          </a-table-column>
-          <a-table-column title="类型" :width="80">
-            <template #cell="{ record }">
-              <a-tag :color="record.builtin ? 'arcoblue' : 'green'" size="small">{{ record.builtin ? '预置' : '自定义' }}</a-tag>
-            </template>
-          </a-table-column>
-          <a-table-column title="描述" data-index="description" :width="200" ellipsis />
-          <a-table-column title="权限" :width="200">
-            <template #cell="{ record }">
-              <a-space wrap>
-                <a-tag v-for="s in (record.scopes || []).slice(0, 3)" :key="s" size="small">{{ s }}</a-tag>
-                <a-tag v-if="(record.scopes || []).length > 3" size="small">+{{ record.scopes.length - 3 }}</a-tag>
-              </a-space>
-            </template>
-          </a-table-column>
-          <a-table-column title="操作" :width="140" fixed="right">
-            <template #cell="{ record }">
-              <a-space>
-                <a-button size="small" @click="openEditRole(record)">编辑</a-button>
-                <a-popconfirm content="确认删除该角色？" @ok="onDeleteRole(record.name)" :disabled="record.builtin">
-                  <a-button size="small" status="danger" :disabled="record.builtin">删除</a-button>
-                </a-popconfirm>
-              </a-space>
-            </template>
-          </a-table-column>
-        </template>
-      </a-table>
-    </a-drawer>
-
     <!-- 角色编辑对话框 -->
     <a-modal :visible="roleVisible" :title="editingRole.builtin ? '编辑预置角色' : (editingRole.isNew ? '新建角色' : '编辑角色')"
       @cancel="roleVisible = false" @ok="saveRole" :ok-loading="savingRole" :width="560">
@@ -186,16 +208,25 @@
             <a-option v-for="s in availableScopes" :key="s" :value="s">{{ s }}</a-option>
           </a-select>
         </a-form-item>
+        <a-form-item v-if="!editingRole.builtin && !editingRole.isNew">
+          <a-popconfirm content="确认删除该角色？" @ok="onDeleteRole(editingRole.name); roleVisible = false">
+            <a-button status="danger" long>删除角色</a-button>
+          </a-popconfirm>
+        </a-form-item>
       </a-form>
     </a-modal>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, watch, onMounted } from 'vue';
+import { ref, reactive, computed, watch, onMounted, markRaw } from 'vue';
 import dayjs from 'dayjs';
 import { Message } from '@arco-design/web-vue';
 import { rpc } from '@/api/rpc';
+import {
+  IconPlus, IconSearch, IconDownload, IconDown, IconEdit, IconDelete,
+  IconCopy, IconUserGroup, IconUser, IconCheckCircle, IconClockCircle,
+} from '@arco-design/web-vue/es/icon';
 
 const loading = ref(false);
 const users = ref<any[]>([]);
@@ -203,7 +234,6 @@ const allRoles = ref<any[]>([]);
 const searchKey = ref('');
 const visible = ref(false);
 const saving = ref(false);
-const showRoleManager = ref(false);
 const roleVisible = ref(false);
 const savingRole = ref(false);
 
@@ -234,13 +264,27 @@ const filteredUsers = computed(() =>
   users.value.filter((u) => !searchKey.value || u.username.toLowerCase().includes(searchKey.value.toLowerCase()) || (u.displayName || '').toLowerCase().includes(searchKey.value.toLowerCase())),
 );
 
-const roleSummary = computed(() => {
-  const map: Record<string, any> = {};
-  for (const r of allRoles.value) {
-    map[r.name] = { role: r.name, label: r.label, color: r.color || '#6d6777', count: users.value.filter((u) => u.role === r.name).length };
-  }
-  return Object.values(map);
+// 统计卡（Materialize）
+const statCards = computed(() => {
+  const total = users.value.length;
+  const enabled = users.value.filter((u) => u.enabled).length;
+  const adminCount = users.value.filter((u) => u.role === 'admin').length;
+  const recentLogin = users.value.filter((u) => u.lastLogin && Date.now() - u.lastLogin < 7 * 86400000).length;
+  return [
+    { title: '总用户', value: total, badge: `${enabled} 启用`, badgeClass: 'up', sub: '全部账号', icon: markRaw(IconUserGroup), iconBg: 'rgba(140, 87, 255, 0.15)' },
+    { title: '管理员', value: adminCount, badge: '核心', badgeClass: 'up', sub: '最高权限', icon: markRaw(IconUser), iconBg: 'rgba(255, 76, 81, 0.15)' },
+    { title: '活跃用户', value: recentLogin, badge: '7 天内', badgeClass: 'up', sub: '最近登录', icon: markRaw(IconCheckCircle), iconBg: 'rgba(86, 202, 0, 0.15)' },
+    { title: '待审批用户', value: users.value.filter((u) => u.approvalEnabled).length, badge: '审批流', badgeClass: 'down', sub: '启用审批', icon: markRaw(IconClockCircle), iconBg: 'rgba(255, 180, 0, 0.15)' },
+  ];
 });
+
+// 角色卡（Materialize app-access-roles）
+const roleCards = computed(() =>
+  allRoles.value.map((r) => {
+    const roleUsers = users.value.filter((u) => u.role === r.name);
+    return { ...r, count: roleUsers.length, users: roleUsers };
+  }),
+);
 
 function roleColor(r: string) { return allRoles.value.find((x) => x.name === r)?.color || '#6d6777'; }
 function roleLabel(r: string) { return allRoles.value.find((x) => x.name === r)?.label || r; }
@@ -306,6 +350,36 @@ async function onDelete(id: string) {
   catch (e: any) { Message.error(e.message); }
 }
 
+function exportUsers(format: string) {
+  const data = filteredUsers.value.map((u) => ({
+    username: u.username, displayName: u.displayName, role: u.role,
+    email: u.email, enabled: u.enabled, lastLogin: u.lastLogin,
+  }));
+  let content: string;
+  let mime: string;
+  let ext: string;
+  if (format === 'csv') {
+    const header = 'username,displayName,role,email,enabled,lastLogin';
+    const rows = data.map((d) => `"${d.username}","${d.displayName}","${d.role}","${d.email || ''}","${d.enabled}","${d.lastLogin || ''}"`);
+    content = [header, ...rows].join('\n');
+    mime = 'text/csv';
+    ext = 'csv';
+  } else {
+    content = JSON.stringify(data, null, 2);
+    mime = 'application/json';
+    ext = 'json';
+  }
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `users-${dayjs().format('YYYYMMDD-HHmm')}.${ext}`;
+  a.click();
+  URL.revokeObjectURL(url);
+  Message.success(`已导出 ${data.length} 个用户`);
+}
+
+// ---------- 角色管理 ----------
 function openCreateRole() {
   Object.assign(editingRole, { name: '', label: '', description: '', color: '#16b1ff', scopes: [], builtin: false, isNew: true });
   roleVisible.value = true;
@@ -313,6 +387,14 @@ function openCreateRole() {
 
 function openEditRole(r: any) {
   Object.assign(editingRole, { ...r, isNew: false });
+  roleVisible.value = true;
+}
+
+function duplicateRole(r: any) {
+  Object.assign(editingRole, {
+    name: `${r.name}_copy`, label: `${r.label} 副本`, description: r.description,
+    color: r.color, scopes: [...(r.scopes || [])], builtin: false, isNew: true,
+  });
   roleVisible.value = true;
 }
 
@@ -343,6 +425,160 @@ onMounted(load);
 </script>
 
 <style lang="less" scoped>
+/* 统计卡（Materialize） */
+.stat-card {
+  position: relative;
+  overflow: hidden;
+  .stat-title {
+    font-size: 13px;
+    color: var(--color-text-3);
+  }
+  .stat-main {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .stat-num {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--color-text-1);
+  }
+  .stat-badge {
+    font-size: 11px;
+    font-weight: 600;
+    &.up { color: var(--brand-success); }
+    &.down { color: var(--brand-danger); }
+  }
+  .stat-sub {
+    font-size: 12px;
+    color: var(--color-text-4);
+    margin-top: 4px;
+  }
+  .stat-icon {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    width: 38px;
+    height: 38px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 19px;
+    color: var(--brand-primary);
+  }
+}
+
+/* Filters */
+.filter-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.filter-right {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.cell-name {
+  font-weight: 500;
+  color: var(--color-text-1);
+}
 .muted { color: var(--color-text-3); font-size: 12px; }
 .hint { font-size: 12px; color: var(--color-text-3); margin-top: 4px; }
+
+/* 角色卡（Materialize app-access-roles） */
+.roles-header {
+  .roles-title {
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--color-text-1);
+    margin: 0;
+  }
+  .roles-sub {
+    font-size: 13px;
+    color: var(--color-text-3);
+    margin: 4px 0 0;
+  }
+}
+
+.role-card {
+  height: 100%;
+  .role-users {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13px;
+    color: var(--color-text-3);
+  }
+  .avatar-stack {
+    display: flex;
+  }
+  .role-name-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    margin-top: 16px;
+  }
+  .role-name {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--color-text-1);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .role-edit {
+    font-size: 13px;
+    margin-top: 4px;
+    display: inline-block;
+  }
+  .role-copy {
+    border: none;
+    background: transparent;
+    color: var(--color-text-4);
+    cursor: pointer;
+    font-size: 16px;
+    padding: 6px;
+    border-radius: 6px;
+    display: flex;
+    &:hover { color: var(--brand-primary); background: var(--color-bg-3); }
+  }
+}
+
+.add-role-card {
+  cursor: pointer;
+  border: 1.5px dashed var(--color-border-2);
+  box-shadow: none !important;
+  &:hover { border-color: var(--brand-primary); }
+  .add-role-inner {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    min-height: 120px;
+    text-align: center;
+  }
+  .add-role-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: rgba(140, 87, 255, 0.12);
+    color: var(--brand-primary);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+  }
+  .add-role-desc {
+    font-size: 12px;
+    color: var(--color-text-4);
+    margin: 8px 0 0;
+  }
+}
 </style>

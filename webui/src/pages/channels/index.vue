@@ -266,15 +266,28 @@ async function save() {
 
 async function testConnection() {
   if (!current.value) return;
+  // 必填字段校验：不输入不允许测试（防止空配置也"测试通过"的假象）
+  const missing = current.value.fields.filter((f) => f.required && !String(current.value!.config[f.key] || '').trim());
+  if (missing.length) {
+    Message.warning(`请先填写必填项：${missing.map((f) => f.label).join('、')}`);
+    testResult.value = { ok: false, message: `缺少必填项：${missing.map((f) => f.label).join('、')}` };
+    return;
+  }
   testing.value = true;
   testResult.value = null;
   try {
-    const res = await rpc.call<{ ok: boolean; message?: string }>('channels.test', {
+    // 后端真实连接测试：按渠道类型调平台 API 验证凭据（飞书 tenant_token / Telegram getMe / Discord @me / 钉钉 gettoken ...）
+    const res = await rpc.call<any>('channels.test', {
       id: current.value.id,
       config: current.value.config,
     });
-    testResult.value = { ok: res.ok, message: res.message || (res.ok ? '连接成功' : '连接失败') };
-    Message.success(res.ok ? '连接成功' : '连接失败');
+    if (res.connected) {
+      testResult.value = { ok: true, message: res.info || '连接成功' };
+      Message.success(res.info || '连接成功');
+    } else {
+      testResult.value = { ok: false, message: res.error || '连接失败' };
+      Message.error(res.error || '连接失败');
+    }
   } catch (e: any) {
     testResult.value = { ok: false, message: e.message };
     Message.error(e.message);

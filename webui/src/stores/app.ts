@@ -1,51 +1,72 @@
 import { defineStore } from 'pinia';
-import { ref, watch } from 'vue';
-import { useDark, useToggle } from '@vueuse/core';
+import { ref, watch, onMounted } from 'vue';
+
+export type ThemeMode = 'light' | 'dark' | 'system';
 
 export const useAppStore = defineStore('app', () => {
-  // 主题：dark / light
-  const isDark = useDark({
-    selector: 'body',
-    attribute: 'arco-theme',
-    valueDark: 'dark',
-    valueLight: '',
-    storageKey: 'cradle-theme',
-  });
-  const toggleDark = useToggle(isDark);
+  // ---------- 主题模式：light / dark / system（跟随系统）----------
+  const themeMode = ref<ThemeMode>((localStorage.getItem('cradle-theme-mode') as ThemeMode) || 'system');
+  const isDark = ref(false);
 
-  // 侧栏折叠（默认强制展开，不记忆折叠状态，避免用户误操作后无法恢复）
-  const menuCollapse = ref(false);
-  // 每次页面加载强制展开（用户若需要折叠，可再点击折叠按钮）
-  menuCollapse.value = false;
+  const systemDarkMedia = window.matchMedia('(prefers-color-scheme: dark)');
 
-  // 主题色（Arco 的 primary 色板）
-  const themeColor = ref(localStorage.getItem('cradle_theme_color') || '#165dff');
-  watch(themeColor, (v) => {
-    localStorage.setItem('cradle_theme_color', v);
-    applyThemeColor(v);
-  });
-
-  function applyThemeColor(hex: string) {
-    // 简化：直接设置 CSS 变量（实际 Arco 主题切换需要完整色板，这里做基础覆盖）
-    const root = document.documentElement;
-    root.style.setProperty('--primary-6', hexToRgb(hex));
+  function applyTheme() {
+    const dark = themeMode.value === 'dark' || (themeMode.value === 'system' && systemDarkMedia.matches);
+    isDark.value = dark;
+    if (dark) {
+      document.body.setAttribute('arco-theme', 'dark');
+    } else {
+      document.body.removeAttribute('arco-theme');
+    }
   }
 
-  function hexToRgb(hex: string): string {
-    const h = hex.replace('#', '');
-    const r = parseInt(h.substring(0, 2), 16);
-    const g = parseInt(h.substring(2, 4), 16);
-    const b = parseInt(h.substring(4, 6), 16);
-    return `${r}, ${g}, ${b}`;
+  function setThemeMode(mode: ThemeMode) {
+    themeMode.value = mode;
+    localStorage.setItem('cradle-theme-mode', mode);
+    applyTheme();
   }
 
-  // 初始化主题色
-  applyThemeColor(themeColor.value);
+  // 跟随系统变化
+  systemDarkMedia.addEventListener('change', () => {
+    if (themeMode.value === 'system') applyTheme();
+  });
+
+  watch(themeMode, applyTheme);
+
+  // ---------- 侧栏折叠（记忆状态，靶心小圆点切换）----------
+  const menuCollapse = ref(localStorage.getItem('cradle-menu-collapse') === '1');
+  // hover 浮出展开（折叠时鼠标悬停临时展开）
+  const menuHoverExpand = ref(false);
+
+  function toggleMenuCollapse() {
+    menuCollapse.value = !menuCollapse.value;
+    localStorage.setItem('cradle-menu-collapse', menuCollapse.value ? '1' : '0');
+  }
+
+  // ---------- 语言 ----------
+  const locale = ref(localStorage.getItem('cradle-locale') || 'zh-CN');
+  function setLocale(l: string) {
+    locale.value = l;
+    localStorage.setItem('cradle-locale', l);
+  }
+
+  // ---------- 主题色（固定 Materialize 紫，不再允许老蓝色覆盖）----------
+  const themeColor = ref('#8c57ff');
+
+  onMounted(() => {
+    applyTheme();
+  });
 
   return {
+    themeMode,
     isDark,
-    toggleDark,
+    setThemeMode,
+    applyTheme,
     menuCollapse,
+    menuHoverExpand,
+    toggleMenuCollapse,
+    locale,
+    setLocale,
     themeColor,
   };
 });

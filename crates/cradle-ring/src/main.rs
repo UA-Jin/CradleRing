@@ -4279,9 +4279,15 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             match state.memory().await {
                 Ok(engine) => {
                     let records = engine.list_memories(None);
+                    // 用 HashSet 按 body 去重：
+                    // 1. memory.add 曾双写 V2+V3（历史数据）
+                    // 2. 覆盖模式迁移可能在 V3 内部产生同 body 多份
+                    // list_memories 已按时间倒序，先出现的是最新版本，保留它
+                    let mut seen_bodies: std::collections::HashSet<String> = std::collections::HashSet::new();
                     let memories: Vec<_> = records.iter().filter_map(|r| {
                         let kind = r.metadata.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                         if kind == "l2_cache" { return None; }
+                        if !seen_bodies.insert(r.text.clone()) { return None; }  // 重复 body 跳过
                         Some(json!({
                             "id": r.id, "kind": kind, "body": r.text,
                             "source": r.metadata.get("source").and_then(|v| v.as_str()).unwrap_or(""),
@@ -4291,13 +4297,15 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                             "createdAt": r.metadata.get("createdAt").and_then(|v| v.as_i64()).unwrap_or(0),
                         }))
                     }).collect();
-                    // 合并 V2（兼容旧数据）
+                    // 合并 V2（兼容旧数据，跳过 V3 已有的同 body 记录）
                     let v2_items = state.storage.load_memory();
-                    let v2_memories: Vec<_> = v2_items.iter().map(|m| json!({
-                        "id": format!("v2-{}", m.id), "kind": &m.kind, "body": &m.body,
-                        "source": &m.source, "confidence": m.confidence,
-                        "createdAt": m.created_at
-                    })).collect();
+                    let v2_memories: Vec<_> = v2_items.iter()
+                        .filter(|m| !seen_bodies.contains(&m.body))
+                        .map(|m| json!({
+                            "id": format!("v2-{}", m.id), "kind": &m.kind, "body": &m.body,
+                            "source": &m.source, "confidence": m.confidence,
+                            "createdAt": m.created_at
+                        })).collect();
                     let mut all = memories;
                     all.extend(v2_memories);
                     json!({ "memories": all, "count": all.len() })
@@ -4390,7 +4398,7 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             }
         }
         "memory.add" | "memory.save" => {
-            // V3 写入（兼容旧 V2 存储）
+            // V3 写入（唯一存储；V2 文件仅作为遗留只读数据，由 memory2.migrate_v2 迁移）
             let body = params["body"].as_str().unwrap_or("").to_string();
             let kind = params["kind"].as_str().unwrap_or("fact").to_string();
             let source = params["source"].as_str().unwrap_or("manual").to_string();
@@ -4398,29 +4406,36 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 .map(|arr| arr.iter().filter_map(|t| t.as_str().map(String::from)).collect())
                 .unwrap_or_default();
 
-            // V2 兼容
-            let mut items = state.storage.load_memory();
-            let v2_id = items.iter().map(|m| m.id).max().unwrap_or(0) + 1;
-            items.push(MemoryItem {
-                id: v2_id, kind: kind.clone(), body: body.clone(),
-                source: source.clone(), confidence: 1.0,
-                created_at: current_ms(),
-            });
-            state.storage.save_memory(&items);
+            if body.trim().is_empty() {
+                return json!({ "ok": false, "error": "body 不能为空" });
+            }
 
             // V3 写入
-            let v3_id = match state.memory().await {
+            match state.memory().await {
                 Ok(engine) => {
                     let req = StoreRequest {
                         body: body.clone(), kind: kind.clone(), source: source.clone(),
                         tags: tags.clone(), session_key: None,
                         original_query: None, model: None,
                     };
-                    engine.store(req).await.ok()
+                    match engine.store(req).await {
+                        Ok(v3_id) => json!({ "id": v3_id, "v3Id": v3_id, "ok": true }),
+                        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+                    }
                 }
-                Err(_) => None,
-            };
-            json!({ "id": v2_id, "v3Id": v3_id, "ok": true })
+                Err(e) => {
+                    // V3 引擎不可用时降级写 V2（保证基本可用）
+                    let mut items = state.storage.load_memory();
+                    let v2_id = items.iter().map(|m| m.id).max().unwrap_or(0) + 1;
+                    items.push(MemoryItem {
+                        id: v2_id, kind: kind.clone(), body: body.clone(),
+                        source: source.clone(), confidence: 1.0,
+                        created_at: current_ms(),
+                    });
+                    state.storage.save_memory(&items);
+                    json!({ "id": v2_id, "ok": true, "fallback": "v2", "warn": e })
+                }
+            }
         }
         "wake" => json!({"ok": true}),
         "last-heartbeat" => json!({"ok": true, "ts": current_ms()}),
@@ -5602,15 +5617,76 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
         // 补充：Memory 扩展
         // ====================================================================
         "memory.delete" => {
-            let id = params["id"].as_u64().unwrap_or(0);
+            // 支持三种 id：V3 字符串 id / "v2-N" 前缀 / V2 数字 id
+            let id_str = params["id"].as_str().map(String::from)
+                .or_else(|| params["id"].as_u64().map(|n| n.to_string()))
+                .or_else(|| params["id"].as_i64().map(|n| n.to_string()))
+                .unwrap_or_default();
+            if id_str.is_empty() {
+                return json!({ "ok": false, "error": {"code": "INVALID_REQUEST", "message": "缺少 id"} });
+            }
+
+            // 1. V3 删除（字符串 id 且不是 v2- 前缀、不是纯数字）
+            if !id_str.starts_with("v2-") && id_str.parse::<u64>().is_err() {
+                if let Ok(engine) = state.memory().await {
+                    match engine.delete_memory(&id_str) {
+                        Ok(true) => return json!({ "ok": true, "deleted": 1, "id": id_str }),
+                        Ok(false) => return json!({ "ok": false, "error": {"code": "NOT_FOUND", "message": "记忆不存在"} }),
+                        Err(e) => return json!({ "ok": false, "error": e.to_string() }),
+                    }
+                }
+            }
+
+            // 2. V2 删除（v2-N 前缀或纯数字 id）
+            let v2_id: u64 = id_str.trim_start_matches("v2-").parse().unwrap_or(0);
             let mut items = state.storage.load_memory();
             let before = items.len();
-            items.retain(|m| m.id != id);
+            items.retain(|m| m.id != v2_id);
             state.storage.save_memory(&items);
-            json!({ "ok": true, "deleted": before - items.len(), "id": id })
+            let deleted = before - items.len();
+            if deleted > 0 {
+                json!({ "ok": true, "deleted": deleted, "id": v2_id })
+            } else {
+                json!({ "ok": false, "error": {"code": "NOT_FOUND", "message": "记忆不存在"} })
+            }
         }
         "memory.update" => {
-            let id = params["id"].as_u64().unwrap_or(0);
+            // 支持 V3 字符串 id（删除+重建）和 V2 数字 id（原地更新）
+            let id_str = params["id"].as_str().map(String::from)
+                .or_else(|| params["id"].as_u64().map(|n| n.to_string()))
+                .unwrap_or_default();
+
+            // V3 更新（字符串 id 且非 v2- 前缀、非纯数字）：向量不可变，走删除+重建
+            if !id_str.is_empty() && !id_str.starts_with("v2-") && id_str.parse::<u64>().is_err() {
+                if let Ok(engine) = state.memory().await {
+                    let old = engine.get_memory(&id_str);
+                    let body = params["body"].as_str().map(String::from)
+                        .or_else(|| old.as_ref().map(|r| r.text.clone()))
+                        .unwrap_or_default();
+                    let kind = params["kind"].as_str().map(String::from)
+                        .or_else(|| old.as_ref().and_then(|r| r.metadata.get("kind").and_then(|v| v.as_str()).map(String::from)))
+                        .unwrap_or_else(|| "fact".to_string());
+                    if body.is_empty() {
+                        return json!({ "ok": false, "error": {"code": "NOT_FOUND", "message": "记忆不存在"} });
+                    }
+                    let source = old.as_ref().and_then(|r| r.metadata.get("source").and_then(|v| v.as_str()).map(String::from)).unwrap_or_else(|| "manual".to_string());
+                    let tags: Vec<String> = old.as_ref()
+                        .and_then(|r| r.metadata.get("tags").and_then(|v| v.as_array()).cloned())
+                        .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    let _ = engine.delete_memory(&id_str);
+                    let req = StoreRequest { body: body.clone(), kind: kind.clone(), source, tags, session_key: None, original_query: None, model: None };
+                    return match engine.store(req).await {
+                        Ok(new_id) => json!({ "ok": true, "id": new_id, "memory": json!({"id": new_id, "kind": kind, "body": body}) }),
+                        Err(e) => json!({ "ok": false, "error": e.to_string() }),
+                    };
+                }
+            }
+
+            // V2 更新
+            let id = params["id"].as_u64()
+                .or_else(|| id_str.trim_start_matches("v2-").parse::<u64>().ok())
+                .unwrap_or(0);
             let mut items = state.storage.load_memory();
             let m = match items.iter_mut().find(|m| m.id == id) {
                 Some(m) => m,
@@ -5952,6 +6028,213 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
         }
 
         // ====================================================================
+        // Memory V3 数据集导入 / 旧版迁移
+        // ====================================================================
+        "memory2.import" => {
+            // 批量导入数据集到 V3 向量库
+            // params:
+            //   format: "json" | "jsonl" | "csv" | "txt"（默认 json）
+            //   data: 字符串（文本内容）
+            //   defaultKind: 缺省 kind（默认 fact）
+            //   defaultSource: 缺省 source（默认 import）
+            //   defaultTags: 缺省 tags（数组，可选）
+            let format = params["format"].as_str().unwrap_or("json");
+            let data = params["data"].as_str().unwrap_or("");
+            let default_kind = params["defaultKind"].as_str().unwrap_or("fact").to_string();
+            let default_source = params["defaultSource"].as_str().unwrap_or("import").to_string();
+            let default_tags: Vec<String> = params["defaultTags"].as_array()
+                .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+
+            if data.trim().is_empty() {
+                return json!({ "ok": false, "error": "data 不能为空" });
+            }
+            let engine = match state.memory().await {
+                Ok(e) => e,
+                Err(e) => return json!({ "ok": false, "error": e }),
+            };
+
+            // 按格式解析为统一的条目列表
+            #[derive(Debug)]
+            struct ImportItem { body: String, kind: String, source: String, tags: Vec<String> }
+            let mut items: Vec<ImportItem> = vec![];
+            let mut parse_errors = 0usize;
+
+            match format {
+                "json" => {
+                    // JSON 数组：[{"body": "...", "kind": "...", "source": "...", "tags": [...]}]
+                    // 也兼容 {"memories": [...]} 包装
+                    match serde_json::from_str::<serde_json::Value>(data) {
+                        Ok(v) => {
+                            let arr = v.as_array()
+                                .or_else(|| v.get("memories").and_then(|m| m.as_array()))
+                                .or_else(|| v.get("data").and_then(|m| m.as_array()));
+                            match arr {
+                                Some(arr) => {
+                                    for item in arr {
+                                        let body = item["body"].as_str()
+                                            .or(item["text"].as_str())
+                                            .or(item["content"].as_str())
+                                            .unwrap_or("").to_string();
+                                        if body.trim().is_empty() { parse_errors += 1; continue; }
+                                        let kind = item["kind"].as_str().unwrap_or(&default_kind).to_string();
+                                        let source = item["source"].as_str().unwrap_or(&default_source).to_string();
+                                        let tags: Vec<String> = item["tags"].as_array()
+                                            .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                                            .unwrap_or_else(|| default_tags.clone());
+                                        items.push(ImportItem { body, kind, source, tags });
+                                    }
+                                }
+                                None => return json!({ "ok": false, "error": "JSON 格式错误：需要数组或 {\"memories\": [...]}" }),
+                            }
+                        }
+                        Err(e) => return json!({ "ok": false, "error": format!("JSON 解析失败: {}", e) }),
+                    }
+                }
+                "jsonl" => {
+                    // 每行一个 JSON 对象
+                    for line in data.lines() {
+                        let line = line.trim();
+                        if line.is_empty() { continue; }
+                        match serde_json::from_str::<serde_json::Value>(line) {
+                            Ok(item) => {
+                                let body = item["body"].as_str()
+                                    .or(item["text"].as_str())
+                                    .or(item["content"].as_str())
+                                    .unwrap_or("").to_string();
+                                if body.trim().is_empty() { parse_errors += 1; continue; }
+                                let kind = item["kind"].as_str().unwrap_or(&default_kind).to_string();
+                                let source = item["source"].as_str().unwrap_or(&default_source).to_string();
+                                let tags: Vec<String> = item["tags"].as_array()
+                                    .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                                    .unwrap_or_else(|| default_tags.clone());
+                                items.push(ImportItem { body, kind, source, tags });
+                            }
+                            Err(_) => parse_errors += 1,
+                        }
+                    }
+                }
+                "csv" => {
+                    // CSV：body,kind,source,tags（tags 用分号分隔；首行是表头则跳过）
+                    for (i, line) in data.lines().enumerate() {
+                        let line = line.trim();
+                        if line.is_empty() { continue; }
+                        // 跳表头
+                        if i == 0 && (line.to_lowercase().starts_with("body,") || line.to_lowercase().starts_with("content,")) {
+                            continue;
+                        }
+                        // 简单 CSV 解析（支持引号包裹）
+                        let cols = parse_csv_line(line);
+                        if cols.is_empty() { parse_errors += 1; continue; }
+                        let body = cols[0].clone();
+                        if body.trim().is_empty() { parse_errors += 1; continue; }
+                        let kind = cols.get(1).filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| default_kind.clone());
+                        let source = cols.get(2).filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| default_source.clone());
+                        let tags: Vec<String> = cols.get(3)
+                            .map(|t| t.split(';').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                            .unwrap_or_else(|| default_tags.clone());
+                        items.push(ImportItem { body, kind, source, tags });
+                    }
+                }
+                "txt" => {
+                    // 纯文本：每行一条记忆
+                    for line in data.lines() {
+                        let line = line.trim();
+                        if line.is_empty() { continue; }
+                        items.push(ImportItem {
+                            body: line.to_string(),
+                            kind: default_kind.clone(),
+                            source: default_source.clone(),
+                            tags: default_tags.clone(),
+                        });
+                    }
+                }
+                _ => return json!({ "ok": false, "error": format!("不支持的格式: {}（支持 json/jsonl/csv/txt）", format) }),
+            }
+
+            if items.is_empty() {
+                return json!({ "ok": false, "error": "没有可导入的有效条目", "parseErrors": parse_errors });
+            }
+
+            // 批量写入 V3（每条生成向量 + 图谱抽取）
+            let mut imported = 0usize;
+            let mut failed = 0usize;
+            let mut ids: Vec<String> = vec![];
+            for item in &items {
+                let req = StoreRequest {
+                    body: item.body.clone(),
+                    kind: item.kind.clone(),
+                    source: item.source.clone(),
+                    tags: item.tags.clone(),
+                    session_key: None,
+                    original_query: None,
+                    model: None,
+                };
+                match engine.store(req).await {
+                    Ok(id) => { imported += 1; ids.push(id); }
+                    Err(_) => failed += 1,
+                }
+            }
+
+            json!({
+                "ok": true,
+                "imported": imported,
+                "failed": failed,
+                "parseErrors": parse_errors,
+                "total": items.len(),
+                "sampleIds": ids.into_iter().take(5).collect::<Vec<_>>(),
+            })
+        }
+        "memory2.migrate_v2" => {
+            // 把 V2 memory.json 的数据迁移到 V3 向量库（一次性）
+            // params: overwrite: bool（默认 false，跳过 V3 已存在的同 body 记录）
+            let overwrite = params["overwrite"].as_bool().unwrap_or(false);
+            let engine = match state.memory().await {
+                Ok(e) => e,
+                Err(e) => return json!({ "ok": false, "error": e }),
+            };
+            let v2_items = state.storage.load_memory();
+            if v2_items.is_empty() {
+                return json!({ "ok": true, "migrated": 0, "skipped": 0, "message": "V2 无数据" });
+            }
+            // 获取 V3 现有 body 集合（去重用）
+            let existing: std::collections::HashSet<String> = if overwrite {
+                std::collections::HashSet::new()
+            } else {
+                engine.list_memories(Some(100000)).iter().map(|r| r.text.clone()).collect()
+            };
+            let mut migrated = 0usize;
+            let mut skipped = 0usize;
+            let mut failed = 0usize;
+            for item in &v2_items {
+                if !overwrite && existing.contains(&item.body) {
+                    skipped += 1;
+                    continue;
+                }
+                let req = StoreRequest {
+                    body: item.body.clone(),
+                    kind: item.kind.clone(),
+                    source: format!("v2-migrate({})", item.source),
+                    tags: vec![],
+                    session_key: None,
+                    original_query: None,
+                    model: None,
+                };
+                match engine.store(req).await {
+                    Ok(_) => migrated += 1,
+                    Err(_) => failed += 1,
+                }
+            }
+            json!({
+                "ok": true,
+                "migrated": migrated,
+                "skipped": skipped,
+                "failed": failed,
+                "v2Total": v2_items.len(),
+            })
+        }
+
+        // ====================================================================
         // 补充：MCP 扩展
         // ====================================================================
         "mcp.start" | "mcp.restart" => {
@@ -6058,8 +6341,62 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             json!({ "ok": true, "channel": id, "deleted": true })
         }
         "channels.test" => {
+            // 真正的渠道连接测试（不再假通过）：
+            // 按渠道类型调用平台 API 验证凭据有效性
             let id = params["id"].as_str().unwrap_or("");
-            json!({ "ok": true, "channel": id, "tested": true, "result": "无上游连接" })
+            // 支持两种模式：
+            // 1. 传入 config（测试未保存的配置）：params.config
+            // 2. 只传 id（测试已保存的配置）
+            let cfg = if params["config"].is_object() {
+                params["config"].clone()
+            } else {
+                let channels = state.config.raw_json.get("channels").and_then(|c| c.as_object()).cloned();
+                channels.and_then(|m| m.get(id).cloned()).unwrap_or(json!({}))
+            };
+            let result = test_channel_connection(id, &cfg).await;
+            match result {
+                Ok(info) => json!({ "ok": true, "channel": id, "tested": true, "connected": true, "info": info }),
+                Err(e) => json!({ "ok": false, "channel": id, "tested": true, "connected": false, "error": e }),
+            }
+        }
+
+        // LLM Provider 连接测试（验证 API Key 有效性）
+        "providers.test" => {
+            let base_url = params["baseUrl"].as_str().unwrap_or("").trim_end_matches('/').to_string();
+            let api_key = params["apiKey"].as_str().unwrap_or("").to_string();
+            let _model = params["model"].as_str().unwrap_or("").to_string();
+            let provider_name = params["provider"].as_str().unwrap_or("openai").to_string();
+            if base_url.is_empty() {
+                return json!({ "ok": false, "connected": false, "error": "缺少 baseUrl" });
+            }
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_default();
+            // 优先调 /models（轻量）；失败则尝试最小 chat completion
+            let models_url = format!("{}/models", base_url);
+            let mut req = client.get(&models_url);
+            if !api_key.is_empty() {
+                if provider_name == "anthropic" {
+                    req = req.header("x-api-key", &api_key).header("anthropic-version", "2023-06-01");
+                } else {
+                    req = req.header("Authorization", format!("Bearer {}", api_key));
+                }
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value = resp.json().await.unwrap_or(json!({}));
+                    let count = body["data"].as_array().map(|a| a.len()).unwrap_or(0);
+                    json!({ "ok": true, "connected": true, "modelsCount": count, "info": format!("连接成功，发现 {} 个模型", count) })
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    let detail: String = text.chars().take(200).collect();
+                    json!({ "ok": false, "connected": false, "error": format!("HTTP {}: {}", status, detail) })
+                }
+                Err(e) => json!({ "ok": false, "connected": false, "error": format!("连接失败: {}", e) }),
+            }
         }
 
         // ====================================================================
@@ -16191,6 +16528,158 @@ fn validate_safe_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 简单 CSV 行解析（支持双引号包裹含逗号的字段、双引号转义 ""）
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut cols = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_quotes {
+            if c == '"' {
+                // 双引号转义："" → "
+                if i + 1 < chars.len() && chars[i + 1] == '"' {
+                    cur.push('"');
+                    i += 1;
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                cur.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == ',' {
+            cols.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(c);
+        }
+        i += 1;
+    }
+    cols.push(cur.trim().to_string());
+    cols
+}
+
+/// 渠道连接测试：按渠道类型调用平台 API 验证凭据
+/// 返回 Ok(平台返回的信息) 或 Err(失败原因)
+async fn test_channel_connection(id: &str, cfg: &serde_json::Value) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+        .unwrap_or_default();
+    match id {
+        "feishu" | "lark" => {
+            let app_id = cfg["appId"].as_str().unwrap_or("");
+            let app_secret = cfg["appSecret"].as_str().unwrap_or("");
+            if app_id.is_empty() || app_secret.is_empty() {
+                return Err("缺少 appId 或 appSecret".into());
+            }
+            let resp = client
+                .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+                .json(&json!({"app_id": app_id, "app_secret": app_secret}))
+                .send().await.map_err(|e| format!("请求失败: {}", e))?;
+            let body: serde_json::Value = resp.json().await.map_err(|e| format!("解析失败: {}", e))?;
+            if body["tenant_access_token"].as_str().is_some() {
+                Ok(format!("凭据有效（tenant_access_token 获取成功，app_id: {}...）", &app_id[..app_id.len().min(8)]))
+            } else {
+                Err(format!("凭据无效: {}（code {}）", body["msg"].as_str().unwrap_or("未知错误"), body["code"]))
+            }
+        }
+        "telegram" => {
+            let token = cfg["botToken"].as_str().unwrap_or("");
+            if token.is_empty() { return Err("缺少 botToken".into()); }
+            let url = format!("https://api.telegram.org/bot{}/getMe", token);
+            let resp = client.get(&url).send().await.map_err(|e| format!("请求失败: {}", e))?;
+            let body: serde_json::Value = resp.json().await.map_err(|e| format!("解析失败: {}", e))?;
+            if body["ok"].as_bool() == Some(true) {
+                let bot = &body["result"];
+                Ok(format!("连接成功：@{}（{}）",
+                    bot["username"].as_str().unwrap_or("?"),
+                    bot["first_name"].as_str().unwrap_or("?")))
+            } else {
+                Err(format!("botToken 无效: {}", body["description"].as_str().unwrap_or("未知错误")))
+            }
+        }
+        "discord" => {
+            let token = cfg["botToken"].as_str().unwrap_or(cfg["token"].as_str().unwrap_or(""));
+            if token.is_empty() { return Err("缺少 botToken".into()); }
+            let resp = client.get("https://discord.com/api/v10/users/@me")
+                .header("Authorization", format!("Bot {}", token))
+                .send().await.map_err(|e| format!("请求失败: {}", e))?;
+            if resp.status().is_success() {
+                let body: serde_json::Value = resp.json().await.unwrap_or(json!({}));
+                Ok(format!("连接成功：{}#{}", body["username"].as_str().unwrap_or("?"), body["discriminator"].as_str().unwrap_or("0")))
+            } else {
+                Err(format!("botToken 无效: HTTP {}", resp.status()))
+            }
+        }
+        "dingtalk" => {
+            let app_key = cfg["appKey"].as_str().unwrap_or(cfg["clientId"].as_str().unwrap_or(""));
+            let app_secret = cfg["appSecret"].as_str().unwrap_or(cfg["clientSecret"].as_str().unwrap_or(""));
+            if app_key.is_empty() || app_secret.is_empty() {
+                return Err("缺少 appKey 或 appSecret".into());
+            }
+            let url = format!("https://oapi.dingtalk.com/gettoken?appkey={}&appsecret={}", app_key, app_secret);
+            let resp = client.get(&url).send().await.map_err(|e| format!("请求失败: {}", e))?;
+            let body: serde_json::Value = resp.json().await.map_err(|e| format!("解析失败: {}", e))?;
+            if body["access_token"].as_str().is_some() {
+                Ok("凭据有效（access_token 获取成功）".into())
+            } else {
+                Err(format!("凭据无效: {}（errcode {}）", body["errmsg"].as_str().unwrap_or("未知错误"), body["errcode"]))
+            }
+        }
+        "wecom" | "wechat_work" => {
+            let corpid = cfg["corpId"].as_str().unwrap_or("");
+            let corpsecret = cfg["corpSecret"].as_str().unwrap_or("");
+            if corpid.is_empty() || corpsecret.is_empty() {
+                return Err("缺少 corpId 或 corpSecret".into());
+            }
+            let url = format!("https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={}&corpsecret={}", corpid, corpsecret);
+            let resp = client.get(&url).send().await.map_err(|e| format!("请求失败: {}", e))?;
+            let body: serde_json::Value = resp.json().await.map_err(|e| format!("解析失败: {}", e))?;
+            if body["access_token"].as_str().is_some() {
+                Ok("凭据有效（access_token 获取成功）".into())
+            } else {
+                Err(format!("凭据无效: {}（errcode {}）", body["errmsg"].as_str().unwrap_or("未知错误"), body["errcode"]))
+            }
+        }
+        "slack" => {
+            let token = cfg["botToken"].as_str().unwrap_or(cfg["token"].as_str().unwrap_or(""));
+            if token.is_empty() { return Err("缺少 botToken".into()); }
+            let resp = client.post("https://slack.com/api/auth.test")
+                .header("Authorization", format!("Bearer {}", token))
+                .send().await.map_err(|e| format!("请求失败: {}", e))?;
+            let body: serde_json::Value = resp.json().await.map_err(|e| format!("解析失败: {}", e))?;
+            if body["ok"].as_bool() == Some(true) {
+                Ok(format!("连接成功：团队 {}（用户 {}）",
+                    body["team"].as_str().unwrap_or("?"), body["user"].as_str().unwrap_or("?")))
+            } else {
+                Err(format!("botToken 无效: {}", body["error"].as_str().unwrap_or("未知错误")))
+            }
+        }
+        "whatsapp" => {
+            let token = cfg["accessToken"].as_str().unwrap_or(cfg["token"].as_str().unwrap_or(""));
+            let phone_id = cfg["phoneNumberId"].as_str().unwrap_or("");
+            if token.is_empty() || phone_id.is_empty() {
+                return Err("缺少 accessToken 或 phoneNumberId".into());
+            }
+            let url = format!("https://graph.facebook.com/v18.0/{}", phone_id);
+            let resp = client.get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .send().await.map_err(|e| format!("请求失败: {}", e))?;
+            if resp.status().is_success() {
+                Ok("凭据有效（phone_number_id 可访问）".into())
+            } else {
+                Err(format!("凭据无效: HTTP {}", resp.status()))
+            }
+        }
+        _ => Err(format!("渠道 {} 暂不支持在线测试（该渠道通过 webhook 被动接收消息，配置保存后由对端平台回调验证）", id)),
+    }
+}
+
 /// Cron 调度器后台循环
 async fn cron_scheduler_loop(state: Arc<AppState>) {
     loop {
@@ -16333,7 +16822,11 @@ async fn handle_websocket_connection(
 
             // ---- 认证门控 ----
             if !authenticated {
-                let is_auth_method = matches!(method, "hello" | "connect" | "auth" | "auth.login" | "login");
+                // 白名单：hello/connect 握手 + 登录类 RPC（登录本身就是获取凭据的过程）
+                let is_auth_method = matches!(method,
+                    "hello" | "connect" | "auth" | "auth.login" | "login"
+                    | "users.login" | "gateway.info" | "wake" | "last-heartbeat"
+                );
                 if !is_auth_method {
                     let resp = json!({"type": "res", "id": id, "ok": false, "error": {"code": "UNAUTHORIZED", "message": "未认证：请先发送 hello/connect 完成认证"}});
                     send_ws_text(&mut stream, &resp.to_string()).await;
