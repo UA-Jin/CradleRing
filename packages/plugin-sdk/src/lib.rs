@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 // Public package facade for plugin SDK re-exports.
 // 翻译自 packages/plugin-sdk/src/index.ts (implicit barrel)
 //

@@ -19,6 +19,18 @@ use memory_engine::{MemoryEngine, MemoryEngineConfig, StoreRequest, RecallReques
 // 基础工具
 // ============================================================================
 
+/// 构建元信息：commit / date / dirty
+/// 由 build.rs 注入；如果 build.rs 未运行（如 tarball 安装），降级为 "unknown"
+fn build_commit() -> &'static str {
+    option_env!("CRADLE_BUILD_COMMIT").unwrap_or("unknown")
+}
+fn build_date() -> &'static str {
+    option_env!("CRADLE_BUILD_DATE").unwrap_or("unknown")
+}
+fn build_dirty() -> bool {
+    option_env!("CRADLE_BUILD_DIRTY").unwrap_or("0") == "1"
+}
+
 fn current_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2156,9 +2168,9 @@ async fn handle_http(
             "status": "live",
             "name": "CradleRing",
             "version": env!("CARGO_PKG_VERSION"),
-            "commit": env!("CRADLE_BUILD_COMMIT"),
-            "commitDate": env!("CRADLE_BUILD_DATE"),
-            "dirty": env!("CRADLE_BUILD_DIRTY") == "1",
+            "commit": build_commit(),
+            "commitDate": build_date(),
+            "dirty": build_dirty(),
             "uptimeMs": current_ms() - state.started_at,
         }).to_string();
         send_response(stream, 200, "OK", "application/json", body.as_bytes()).await;
@@ -2169,8 +2181,8 @@ async fn handle_http(
         let body = serde_json::json!({
             "token": state.config.token,
             "version": env!("CARGO_PKG_VERSION"),
-            "commit": env!("CRADLE_BUILD_COMMIT"),
-            "commitDate": env!("CRADLE_BUILD_DATE"),
+            "commit": build_commit(),
+            "commitDate": build_date(),
             "websocket": "ws://127.0.0.1:18800/ws",
             "home": state.storage.home,
         }).to_string();
@@ -6272,9 +6284,9 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
         "system.info" => {
             json!({
                 "version": env!("CARGO_PKG_VERSION"),
-                "commit": env!("CRADLE_BUILD_COMMIT"),
-                "commitDate": env!("CRADLE_BUILD_DATE"),
-                "dirty": env!("CRADLE_BUILD_DIRTY") == "1",
+                "commit": build_commit(),
+                "commitDate": build_date(),
+                "dirty": build_dirty(),
                 "uptimeMs": current_ms() - state.started_at,
             })
         }
@@ -6293,12 +6305,12 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                         let latest_sha = data["sha"].as_str().unwrap_or("").to_string();
                         let latest_date = data["commit"]["author"]["date"].as_str().unwrap_or("").to_string();
                         let latest_msg = data["commit"]["message"].as_str().unwrap_or("").to_string();
-                        let current_sha = env!("CRADLE_BUILD_COMMIT");
+                        let current_sha = build_commit();
                         let has_update = !latest_sha.is_empty() && latest_sha != current_sha;
                         json!({
                             "hasUpdate": has_update,
                             "currentCommit": current_sha,
-                            "currentDate": env!("CRADLE_BUILD_DATE"),
+                            "currentDate": build_date(),
                             "latestCommit": latest_sha.chars().take(8).collect::<String>(),
                             "latestDate": latest_date,
                             "latestMessage": latest_msg,
