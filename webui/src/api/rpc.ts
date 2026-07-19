@@ -230,19 +230,81 @@ class RpcClient {
     }
   }
 
-  /** 调用 RPC 方法（遇到 UNAUTHORIZED 自动重新认证重试一次） */
+  /** 全局 sudo 密码缓存（用户输入一次后后续请求自动带上） */
+  private sudoPassword = '';
+
+  /** 弹窗请求 sudo 密码（用 Arco 的 Modal.prompt 不可用，改用原生 prompt + 动态 import） */
+  private async requestSudoPassword(): Promise<string> {
+    // 用 Arco Design 的 Modal 输入框
+    const { Modal, Input } = await import('@arco-design/web-vue');
+    return new Promise<string>((resolve) => {
+      let inputValue = '';
+      const app = document.createElement('div');
+      document.body.appendChild(app);
+      const modal = Modal.open({
+        title: '🔐 需要管理员密码',
+        content: '此操作需要 sudo 权限，请输入管理员密码：',
+        okText: '确认',
+        cancelText: '取消',
+        modalClass: 'sudo-modal',
+        onOk: () => {
+          resolve(inputValue);
+          modal.close();
+        },
+        onCancel: () => {
+          resolve('');
+          modal.close();
+        },
+      });
+      // 动态插入密码输入框
+      setTimeout(() => {
+        const body = document.querySelector('.sudo-modal .arco-modal-body');
+        if (body) {
+          const wrapper = document.createElement('div');
+          wrapper.style.marginTop = '12px';
+          const input = document.createElement('input');
+          input.type = 'password';
+          input.placeholder = 'sudo 密码';
+          input.style.width = '100%';
+          input.style.padding = '8px 12px';
+          input.style.borderRadius = '6px';
+          input.style.border = '1px solid var(--color-border-2)';
+          input.style.fontSize = '14px';
+          input.style.background = 'var(--color-bg-2)';
+          input.style.color = 'var(--color-text-1)';
+          input.addEventListener('input', (e) => { inputValue = (e.target as HTMLInputElement).value; });
+          input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { resolve(inputValue); modal.close(); } });
+          wrapper.appendChild(input);
+          body.appendChild(wrapper);
+          input.focus();
+        }
+      }, 100);
+    });
+  }
+
+  /** 调用 RPC 方法（遇到 UNAUTHORIZED 自动重新认证；遇到 NEED_SUDO_PASSWORD 弹窗输入密码重试） */
   async call<T = any>(method: string, params: Record<string, any> = {}): Promise<T> {
     try {
-      return await this._callOnce<T>(method, params);
+      // 如果有缓存的 sudo 密码，自动带上
+      const finalParams = this.sudoPassword ? { ...params, sudoPassword: this.sudoPassword } : params;
+      return await this._callOnce<T>(method, finalParams);
     } catch (e: any) {
       const msg = String(e?.message || '');
+      // sudo 密码请求：弹窗输入后重试
+      if (msg.includes('NEED_SUDO_PASSWORD') || msg.includes('管理员密码')) {
+        const pwd = await this.requestSudoPassword();
+        if (pwd) {
+          this.sudoPassword = pwd;
+          return await this._callOnce<T>(method, { ...params, sudoPassword: pwd });
+        }
+        throw new Error('操作已取消（需要 sudo 密码）');
+      }
+      // 认证失败：重新认证后重试
       if (msg.includes('未认证') || msg.includes('UNAUTHORIZED') || msg.includes('AUTH_FAILED')) {
-        // 重新认证后重试一次
         const ok = await this.reauthenticate();
         if (ok) {
           return await this._callOnce<T>(method, params);
         }
-        // 认证仍失败：如果本地没 token，跳登录页
         if (!this.getToken() && location.pathname !== '/login') {
           location.href = '/login';
         }

@@ -4036,6 +4036,9 @@ async fn send_ws_close(stream: &mut tokio::net::TcpStream) {
 // ============================================================================
 
 async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Value) -> serde_json::Value {
+    // 全局提取 sudo 密码（前端用户输入后通过 sudoPassword 参数传入）
+    let sudo_password: String = params["sudoPassword"].as_str().unwrap_or("").to_string();
+
     #[allow(unreachable_patterns)]
     match method {
         "health" => json!({"ok": true, "uptimeMs": current_ms() - state.started_at}),
@@ -9938,49 +9941,29 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
             };
             // apt / dnf / yum 通常需要先 update
             if pm_check == "apt" {
-                let _ = tokio::process::Command::new("sh").arg("-c")
-                    .arg("sudo apt-get update 2>&1 | tail -5").output().await;
+                let _ = run_sudo("apt-get update", &sudo_password).await;
             }
-            let mut cmd_str = format!("sudo {}", install_cmd.join(" "));
+            let mut cmd_str = install_cmd.join(" ");
             for p in &pkgs {
                 cmd_str.push(' ');
                 cmd_str.push_str(p);
             }
-            // 执行
-            let output = tokio::process::Command::new("sh").arg("-c").arg(&cmd_str)
-                .output().await;
-            match output {
-                Ok(o) => {
-                    let stdout = String::from_utf8_lossy(&o.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                    let exit_code = o.status.code().unwrap_or(-1);
-                    if o.status.success() {
-                        json!({
-                            "ok": true,
-                            "env": env_id,
-                            "action": "install",
-                            "packages": pkgs,
-                            "packageManager": pm_check,
-                            "exitCode": exit_code,
-                            "stdout": stdout.chars().take(2000).collect::<String>(),
-                            "stderr": stderr.chars().take(1000).collect::<String>(),
-                        })
-                    } else {
-                        json!({
-                            "ok": false,
-                            "env": env_id,
-                            "action": "install",
-                            "exitCode": exit_code,
-                            "stdout": stdout.chars().take(2000).collect::<String>(),
-                            "stderr": stderr.chars().take(1500).collect::<String>(),
-                            "error": {"code": "INSTALL_FAILED", "message": format!("安装失败（exit {}），详见 stderr", exit_code)},
-                        })
-                    }
+            // 用 run_sudo 执行（支持密码）
+            match run_sudo(&cmd_str, &sudo_password).await {
+                Ok(stdout) => {
+                    json!({
+                        "ok": true,
+                        "env": env_id,
+                        "action": "install",
+                        "packages": pkgs,
+                        "packageManager": pm_check,
+                        "stdout": stdout.chars().take(2000).collect::<String>(),
+                    })
                 }
-                Err(e) => json!({
+                Err(err_json) => json!({
                     "ok": false,
                     "env": env_id,
-                    "error": {"code": "EXEC_FAILED", "message": format!("执行失败: {}", e)},
+                    "error": err_json,
                 }),
             }
         }
@@ -10022,43 +10005,24 @@ async fn handle_rpc(state: Arc<AppState>, method: &str, params: serde_json::Valu
                 "zypper" => vec!["zypper", "--non-interactive", "remove"],
                 _ => return json!({"ok": false, "error": {"code": "NO_PACKAGE_MANAGER", "message": "未检测到支持的包管理器"}}),
             };
-            let mut cmd_str = format!("sudo {}", remove_args.join(" "));
+            let mut cmd_str = remove_args.join(" ");
             for p in &pkg_name {
                 cmd_str.push(' ');
                 cmd_str.push_str(p);
             }
-            let output = tokio::process::Command::new("sh").arg("-c").arg(&cmd_str)
-                .output().await;
-            match output {
-                Ok(o) => {
-                    let stdout = String::from_utf8_lossy(&o.stdout).to_string();
-                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                    let exit_code = o.status.code().unwrap_or(-1);
-                    if o.status.success() {
-                        json!({
-                            "ok": true,
-                            "env": env_id,
-                            "action": "uninstall",
-                            "exitCode": exit_code,
-                            "stdout": stdout.chars().take(2000).collect::<String>(),
-                            "stderr": stderr.chars().take(1000).collect::<String>(),
-                        })
-                    } else {
-                        json!({
-                            "ok": false,
-                            "env": env_id,
-                            "action": "uninstall",
-                            "exitCode": exit_code,
-                            "stdout": stdout.chars().take(2000).collect::<String>(),
-                            "stderr": stderr.chars().take(1500).collect::<String>(),
-                            "error": {"code": "UNINSTALL_FAILED", "message": format!("卸载失败（exit {}），详见 stderr", exit_code)},
-                        })
-                    }
+            match run_sudo(&cmd_str, &sudo_password).await {
+                Ok(stdout) => {
+                    json!({
+                        "ok": true,
+                        "env": env_id,
+                        "action": "uninstall",
+                        "stdout": stdout.chars().take(2000).collect::<String>(),
+                    })
                 }
-                Err(e) => json!({
+                Err(err_json) => json!({
                     "ok": false,
                     "env": env_id,
-                    "error": {"code": "EXEC_FAILED", "message": format!("执行失败: {}", e)},
+                    "error": err_json,
                 }),
             }
         }
@@ -19510,6 +19474,73 @@ async fn cron_scheduler_loop(state: Arc<AppState>) {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         // 简化：每 30 秒检查一次 cron_jobs.json
         let _ = &state;
+    }
+}
+
+/// 执行需要 sudo 的命令（自动处理密码）
+///
+/// - 有密码：`echo '密码' | sudo -S 命令`（从 stdin 读取，不暴露在进程列表）
+/// - 无密码：先尝试普通 sudo，失败返回 NEED_SUDO_PASSWORD 错误码
+///
+/// 返回 Ok(stdout) 或 Err(json!({"code": "NEED_SUDO_PASSWORD", ...}))
+async fn run_sudo(cmd: &str, password: &str) -> Result<String, serde_json::Value> {
+    use std::process::Stdio;
+    // 有密码：用 sudo -S 从 stdin 读取
+    let full_cmd = if !password.is_empty() {
+        format!("sudo -S {}", cmd)
+    } else {
+        format!("sudo -n {}", cmd)  // -n = 非交互式（无密码时直接失败）
+    };
+    let mut child = if !password.is_empty() {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&full_cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| json!({"code": "EXEC_ERROR", "message": format!("启动失败: {}", e)}))?
+    } else {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&full_cmd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| json!({"code": "EXEC_ERROR", "message": format!("启动失败: {}", e)}))?
+    };
+    // 写入密码
+    if !password.is_empty() {
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(format!("{}\n", password).as_bytes()).await;
+        }
+    }
+    let output = child.wait_with_output().await
+        .map_err(|e| json!({"code": "EXEC_ERROR", "message": format!("等待失败: {}", e)}))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    // sudo -S 会把密码提示打到 stderr，过滤掉
+    let stderr_clean = stderr.lines()
+        .filter(|l| !l.contains("[sudo]") && !l.starts_with("Password:"))
+        .collect::<Vec<_>>().join("\n");
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        // 检查是否是密码问题
+        if password.is_empty() && (stderr.contains("sudo: a password is required") || stderr.contains("sudo: 读取密码") || stderr.contains("[sudo]")) {
+            Err(json!({
+                "code": "NEED_SUDO_PASSWORD",
+                "message": "此操作需要管理员密码，请输入 sudo 密码",
+                "command": cmd,
+            }))
+        } else {
+            Err(json!({
+                "code": "EXEC_FAILED",
+                "message": stderr_clean.chars().take(500).collect::<String>(),
+                "exitCode": output.status.code().unwrap_or(-1),
+            }))
+        }
     }
 }
 
